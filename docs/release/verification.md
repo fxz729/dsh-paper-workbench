@@ -16,7 +16,7 @@
 | 发行检查 | 实际结果 | 范围 |
 | --- | --- | --- |
 | `npm run check:package` / `npm run pack:release` | 退出码 0 | 运行文件白名单、入口加载、包名/客户端/bundle 一致、私人许可及用户数据排除；Release 附 SHA-256 |
-| `npm run smoke:install` | 退出码 0 | 在空临时项目中仅安装发行包与生产依赖；使用实际 DSH 0.2.2-rc.1 工具 SDK 注册六个工具，执行 `library_manage list` 成功；临时目录已清理 |
+| `npm run smoke:install` | 退出码 0 | 在空临时项目中仅安装发行包与生产依赖；实际 DSH 0.2.2-rc.1 SDK 加载六个工具定义，经隔离注册接口收集后直接执行 `library_manage list` 成功；完整宿主工具服务与 GUI 验收另列 |
 | 原生插件索引解析 | 退出码 0 | 使用实际 DSH format-1 解析器与 `marketInstallTarget`，确认版本、兼容声明和固定 Git commit 对应安装目标 |
 
 本轮测试和演示不读取用户的实际文献库、会话历史或私人 tldraw 许可；真实收费模型请求数为 0。
@@ -30,3 +30,11 @@
 首次演示曾因测试 fixture 错用 Playwright `Frame.reload` 退出；修正为 `frame.goto(frame.url())` 后按原断言重新完整运行 5 项。该问题未修改产品逻辑，两个运行窗口的计数分开保留。
 
 四张截图见 [截图范围说明](screenshots.md)。`tests/details-browser.cjs` 是另外保留的旧契约浏览器辅助，仅做了语法检查；本轮演示结果来自上面的发布 fixture。
+
+## 线上发布状态
+
+- 公开仓库与 `v1.0.0` tag 已推送，Release 已公开发布安装包、`SHA256SUMS`、文件清单和索引副本。
+- 最终安装包 3,334,477 字节，125 个文件；SHA-256 为 `7fbd60f4ee37d3dd031bddc91eb172069b6ff2edcd01864978505eed640ed261`。该确切压缩包通过最终干净安装，GitHub 资产服务返回相同 digest；从公开 Release 重新下载后的大小与 SHA-256 也与该测试包完全一致。
+- 公开自定义索引 URL 已读取，固定源码 commit 为 `0a25f69dd7cb4c5981f6ba5bf9093699122aaa01`。
+- [社区收录 PR #14075](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/14075) 已提交，等待仓库满一天及维护者审核。
+- GitHub Actions 云端检查受账户级限制，在任何执行步骤开始前结束，尚无云端构建和测试结果。本地已执行的检查结果如上；账户限制解除后再运行云端流程。

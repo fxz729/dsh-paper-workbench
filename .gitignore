@@ -1,7 +1,7 @@
 node_modules/
-release/
-artifacts/
-coverage/
+/release/
+/artifacts/
+/coverage/
 .env
 .env.*
 !.env.example

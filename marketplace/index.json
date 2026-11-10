@@ -1,0 +1,39 @@
+{
+  "format": 1,
+  "title": {
+    "en": "DSH Paper Workbench",
+    "zh": "DSH 文献工作台"
+  },
+  "plugins": [
+    {
+      "name": "@fxz729/dsh-paper-workbench",
+      "title": {
+        "en": "Paper Workbench",
+        "zh": "文献工作台"
+      },
+      "description": {
+        "en": "Nested paper libraries, literature management tools, PDF reading, native AI chat and optional translation and ink.",
+        "zh": "嵌套文献库、文献管理工具、PDF 阅读与原生 AI 伴读，可选翻译和手写墨迹。"
+      },
+      "author": "fxz729",
+      "homepage": "https://github.com/fxz729/dsh-paper-workbench",
+      "repository": {
+        "url": "https://github.com/fxz729/dsh-paper-workbench"
+      },
+      "versions": [
+        {
+          "version": "1.0.0",
+          "publishTimestamp": 1794333550,
+          "engines": {
+            "dsh": "0.2.2-rc.1"
+          },
+          "source": {
+            "type": "git",
+            "url": "https://github.com/fxz729/dsh-paper-workbench",
+            "commit": "0a25f69dd7cb4c5981f6ba5bf9093699122aaa01"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -2,10 +2,12 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 const root=fileURLToPath(new URL('../',import.meta.url));
 const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
 const filename=process.argv[2]||join(root,'release',pkg.name.replace('@','').replace('/','-')+'-'+pkg.version+'.tgz');
+const packageSHA256=createHash('sha256').update(await readFile(resolve(filename))).digest('hex');
 const owned=await mkdtemp(join(tmpdir(),'dsh-paper-workbench-install-'));
 const npm=process.env.npm_execpath;if(!npm?.endsWith('.js'))throw Error('Run with npm run smoke:install');
 const env={...process.env,DSH_HOME:join(owned,'home'),DSH_PAPER_READER_DATA:join(owned,'library')};
@@ -28,6 +30,6 @@ try{apply(ctx,{dataDir:process.env.DSH_PAPER_READER_DATA});runtime=getPaperRunti
  const smoke=spawnSync(process.execPath,['smoke.mjs'],{cwd:owned,env,encoding:'utf8',maxBuffer:4*1024*1024,timeout:30000});
  if(smoke.status!==0)throw Error('Installed plugin smoke failed: '+smoke.stdout+'\n'+smoke.stderr);
  console.log(smoke.stdout.trim());await mkdir(join(root,'artifacts'),{recursive:true});
- await writeFile(join(root,'artifacts/clean-install.json'),JSON.stringify({version:pkg.version,tarballInstall:true,actualDshToolsSdk:true,toolRegistration:true,localList:true,isolatedHome:true,paidRequests:0,fullDesktopAcceptance:false},null,2)+'\n');
+ await writeFile(join(root,'artifacts/clean-install.json'),JSON.stringify({version:pkg.version,packageSHA256,tarballInstall:true,actualDshToolsSdk:true,toolRegistration:true,localList:true,isolatedHome:true,paidRequests:0,fullDesktopAcceptance:false},null,2)+'\n');
 }finally{await rm(owned,{recursive:true,force:true});}
 console.log('CLEAN_INSTALL_OK; temporary home and installation removed');

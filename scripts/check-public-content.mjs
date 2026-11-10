@@ -1,12 +1,12 @@
 import { readdir, readFile, lstat, access } from 'node:fs/promises';
-import { join, extname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root=fileURLToPath(new URL('../',import.meta.url));
 const ignored=new Set(['node_modules','.git','release','artifacts','coverage']);
 let checked=0;const failures=[];
 async function scan(dir,rel=''){
  for(const item of await readdir(dir,{withFileTypes:true})){
-  if(ignored.has(item.name))continue;
+  if(rel===''&&ignored.has(item.name))continue;
   const file=join(dir,item.name),name=rel+item.name;
   if(item.isSymbolicLink()){failures.push(name+': symlink');continue;}
   if(item.isDirectory()){await scan(file,name+'/');continue;}
@@ -20,6 +20,11 @@ async function scan(dir,rel=''){
   const privatePath=/[CD]:[\\/]Users[\\/]\d{4,}|D:[\\/]HuaweiMoveData|D:[\\/]Projects[\\/][\w-]+/;
   const credential=/(?:gh[pousr]_[A-Za-z0-9]{25,}|github_pat_[A-Za-z0-9_]{25,}|sk-[A-Za-z0-9]{24,}|tldraw-[A-Za-z0-9_+/.=]{40,}|-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----)/;
   if(privatePath.test(text)||credential.test(text))failures.push(name+': private path or credential pattern');
+  if(name.endsWith('.md'))for(const match of text.matchAll(/\]\((?:<([^>]+)>|([^\s)]+))\)/g)){
+   const target=match[1]||match[2];if(/^(?:[a-z]+:|#)/i.test(target))continue;
+   const relative=decodeURIComponent(target.split('#')[0]);if(!relative)continue;
+   try{await access(resolve(dirname(file),relative));}catch{failures.push(name+': broken local document link');}
+  }
  }
 }
 await scan(root);

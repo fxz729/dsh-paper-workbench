@@ -1,0 +1,16 @@
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { checkPackage } from './check-package.mjs';
+const root=fileURLToPath(new URL('../',import.meta.url));
+const {pkg}=await checkPackage();
+const destination=join(root,'release');await mkdir(destination,{recursive:true});
+const result=spawnSync(process.execPath,[process.env.npm_execpath,'pack','--json','--ignore-scripts','--pack-destination',destination],{cwd:root,encoding:'utf8',maxBuffer:8*1024*1024,timeout:60000});
+if(result.status!==0)throw Error('Package creation failed: '+result.stderr);
+const report=JSON.parse(result.stdout)[0],file=join(destination,report.filename);
+const sha256=createHash('sha256').update(await readFile(file)).digest('hex');
+await writeFile(join(destination,'SHA256SUMS'),sha256+'  '+report.filename+'\n');
+await writeFile(join(destination,'release-manifest.json'),JSON.stringify({name:pkg.name,version:pkg.version,filename:report.filename,sha256,size:report.size,unpackedSize:report.unpackedSize,integrity:report.integrity,files:report.files.map(row=>row.path)},null,2)+'\n');
+console.log(JSON.stringify({package:pkg.name,version:pkg.version,file:report.filename,sha256,size:report.size}));

@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="dpr-ui-csrf" content="__DPR_UI_CSRF__">
+<title>文献信息</title>
+<style>
+:root{--paper:#f8f8f3;--sheet:#fffefb;--ink:#29352e;--muted:#70796f;--line:#dce1d7;--accent:#42634e;--wash:#edf2e9;--warn:#865c27;--error:#9b4039;font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--paper);font-size:14px;line-height:1.65;color-scheme:light}
+*{box-sizing:border-box}body{margin:0}main{max-width:940px;margin:auto;padding:16px clamp(12px,3vw,28px) 24px}h1,h2,p{margin:0}h1{font-family:Georgia,"Songti SC",SimSun,serif;font-size:22px;font-weight:500;line-height:1.4}h2,label{font-size:14px;font-weight:600}button,input,textarea{font:inherit;color:inherit}button{border:1px solid var(--line);border-radius:6px;padding:5px 11px;background:var(--sheet);cursor:pointer;max-width:100%}button:hover:not(:disabled){background:var(--wash);border-color:#a8b7a5}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button:disabled{opacity:.48;cursor:default}button.quiet{border-color:transparent;background:transparent;color:var(--muted)}:focus-visible{outline:2px solid var(--accent);outline-offset:3px}header,.section-head{display:flex;gap:12px;align-items:center;justify-content:space-between}header{align-items:flex-start;padding-bottom:12px;border-bottom:1px solid var(--line)}header>div{min-width:0}#entity-name{margin-top:3px;font-size:13px;color:var(--muted);overflow-wrap:anywhere}.section{padding:14px 0;border-bottom:1px solid var(--line)}.section-head{margin-bottom:9px}#summary-content{font:inherit;font-size:15px;line-height:1.9;white-space:pre-wrap;overflow-wrap:anywhere;min-height:68px;margin:0;padding:2px 0 8px}.automation-grid{display:flex;gap:12px 24px;flex-wrap:wrap}.check{display:flex;gap:7px;align-items:center;font-size:13px;font-weight:400}input[type=checkbox]{width:16px;height:16px;margin:0;accent-color:var(--accent)}input:not([type=checkbox]),textarea{width:100%;border:1px solid var(--line);border-radius:6px;padding:8px 10px;background:var(--sheet)}textarea{min-height:200px;resize:vertical;line-height:1.85}label[for]{display:block;margin-bottom:6px}#status{margin-top:9px;font-size:12px;overflow-wrap:anywhere}#status:empty{display:none}#status[data-tone=error]{color:var(--error)}#status[data-tone=warn]{color:var(--warn)}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin-top:9px}.subtle,details>summary{color:var(--muted);font-size:12px}details>summary{cursor:pointer}#more-panel{margin-top:12px}#more-panel>summary{padding:2px 0}#more-panel .section:last-child{border:0}pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}.confirm,.inset{margin-top:10px;border:1px solid var(--line);border-radius:6px;padding:11px;background:var(--wash);font-size:13px}.confirm ul{margin:6px 0;padding-left:20px}.job{padding:5px 0;font-size:12px;color:var(--muted);overflow-wrap:anywhere}.state{margin-right:6px}#close-panel,#generate-summary{white-space:nowrap}[hidden]{display:none!important}
+@media(max-width:500px){main{padding-top:12px}h1{font-size:20px}.section{padding:12px 0}.actions button{padding-inline:9px}}
+@media(prefers-color-scheme:dark){:root{--paper:#1e2520;--sheet:#252e27;--ink:#e0e6dc;--muted:#a2afa0;--line:#3c483d;--accent:#7eab89;--wash:#2c3b30;--warn:#dfbc7e;--error:#efa19a;color-scheme:dark}button.primary{color:#14271a;background:#91b79a;border-color:#91b79a}}
+</style>
+</head>
+<body>
+<main>
+<header><div><h1 id="heading">文献信息</h1><p id="entity-name"></p></div><button id="close-panel" class="quiet" type="button" aria-label="关闭文献信息面板">关闭</button></header>
+<p id="status" role="status" aria-live="polite" aria-atomic="true"></p>
+<section id="summary-section" class="section" aria-labelledby="summary-heading" hidden>
+<div class="section-head"><h2 id="summary-heading">摘要</h2><button id="generate-summary" class="primary" type="button" title="点击即授权本次 API 请求并保存摘要" disabled>生成</button></div>
+<pre id="summary-content" aria-label="论文摘要"></pre>
+</section>
+<section id="collection-editor" class="section" hidden>
+<label id="editor-label" for="editor">库备注</label><textarea id="editor" disabled spellcheck="false" placeholder="记录库的范围与阅读线索…"></textarea>
+<div class="actions"><button id="save-local" class="primary" type="button" disabled>保存本地</button><button id="copy-draft" type="button" disabled>复制草稿</button><button id="export-draft" class="quiet" type="button" disabled>导出草稿</button><span id="dirty-state" class="subtle"></span></div>
+<div id="conflict" class="inset" hidden><p>备注版本已变化，草稿已保留。</p><button id="reload-remote" type="button">载入远端版本…</button></div>
+<div id="reload-confirm" class="confirm" hidden><p>载入会替换当前草稿。</p><div class="actions"><button id="confirm-reload" type="button">确认载入远端</button><button id="cancel-reload" type="button">保留草稿</button></div></div>
+<div id="close-confirm" class="confirm" hidden><p>有未保存的备注。</p><div class="actions"><button id="cancel-close" type="button">继续编辑</button><button id="confirm-close" type="button">放弃草稿并关闭</button></div></div>
+</section>
+<section class="section" aria-label="自动处理新增文献">
+<div class="automation-grid"><label class="check" title="全局设置，仅开启后新增文献；勾选即授权相应 API 费用"><input id="auto-summary" type="checkbox" aria-describedby="auto-scope-hint" disabled><span>自动摘要</span></label><label class="check" title="全局设置，仅开启后新增文献；勾选即授权相应 API 费用"><input id="auto-name" type="checkbox" aria-describedby="auto-scope-hint" disabled><span>自动命名</span></label></div>
+<p id="auto-scope-hint" class="subtle" style="margin-top:6px">仅处理开启后新增的文献</p>
+</section>
+<details id="more-panel"><summary>更多</summary>
+<section id="paper-section" class="section" hidden><h2>书目信息</h2><pre id="bibliography" class="subtle"></pre></section>
+<section class="section"><h2>库内名称</h2><label for="new-name" id="name-label">名称</label><input id="new-name" maxlength="1000" autocomplete="off" disabled>
+<div id="suggestion-row" class="actions" hidden><button id="use-suggestion" type="button">使用书目建议</button><span id="name-suggestion" class="subtle"></span></div>
+<div class="actions"><button id="preview-name" type="button" disabled>预览改名</button></div>
+<div id="rename-confirm" class="confirm" hidden><p id="rename-title"></p><ul id="rename-files"></ul><p id="rename-effects"></p><p id="rename-conflicts"></p><div class="actions"><button id="confirm-rename" type="button">确认改名</button><button id="cancel-rename" type="button">取消</button></div></div>
+</section>
+<section id="jobs-section" class="section" hidden><h2>任务状态</h2><div id="jobs"></div></section>
+<div class="actions"><button id="refresh-details" class="quiet" type="button" disabled>刷新信息</button></div>
+</details>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const csrfUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const paperId = params.get('paperId'), collectionId = params.get('collectionId');
+const validIdentity = (Boolean(paperId) !== Boolean(collectionId)) && uuid.test(paperId || collectionId || '') && Array.from(params.keys()).every(key => key === 'paperId' || key === 'collectionId') && Array.from(params.keys()).length === 1;
+const identity = paperId ? { paperId } : { collectionId }, query = new URLSearchParams(identity).toString();
+let details = null, metadata = null, automation = null, baseDraft = '', busy = false, disposed = false, pendingAutomation = null, attempt = null, retryJob = null, renamePlan = null, pollTimer = 0, allowUnload = false;
+const controllers = new Set(), text = value => typeof value === 'string' ? value : '';
+function status(message, tone = '') { if (disposed) return; $('status').textContent = message; $('status').dataset.tone = tone; }
+function notify(type) { if (parent !== window) parent.postMessage({ type, ...identity }, location.origin); }
+async function api(path, body) {
+  const controller = new AbortController(); controllers.add(controller);
+  const timeout = setTimeout(() => controller.abort(), 20000), headers = body === undefined ? {} : { 'content-type': 'application/json' };
+  const csrf = document.querySelector('meta[name="dpr-ui-csrf"]')?.content;
+  if (body !== undefined && csrfUuid.test(csrf || '')) headers['x-dpr-ui-csrf'] = csrf;
+  try {
+    const response = await fetch('/paper-reader/api' + path, { method: body === undefined ? 'GET' : 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
+    let value;
+    try { value = await response.json(); }
+    catch { const error = new Error('HTTP ' + response.status + ' 响应格式异常'); error.status = response.status; throw error; }
+    if (!response.ok) { const error = new Error(text(value?.error?.message) || text(value?.error) || 'HTTP ' + response.status); error.status = response.status; throw error; }
+    return value;
+  } finally { clearTimeout(timeout); controllers.delete(controller); }
+}
+const changed = () => Boolean(metadata && details?.kind === 'collection' && $('editor').value !== baseDraft);
+function proposedName() {
+  const b = metadata?.bibliography || {};
+  return b.firstAuthor && /^\d{4}$/.test(b.year || '') && b.originalTitle ? b.firstAuthor + (b.hasMoreAuthors ? '等' : '') + '-' + b.year + '-' + b.originalTitle : '';
+}
+function validLocalName(value) {
+  const name = value.trim();
+  return !!name && !name.startsWith('.') && !/[<>:"\/\\|?*\u0000-\u001f\u007f]/.test(name) && !/[. ]$/.test(name) && !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(name);
+}
+function updateControls() {
+  const ready = !!metadata && !busy && !disposed, paper = details?.kind === 'paper', flags = pendingAutomation || automation;
+  $('editor').disabled = !ready || paper;
+  for (const id of ['save-local', 'copy-draft', 'export-draft']) $(id).disabled = !ready || paper;
+  for (const id of ['new-name', 'refresh-details']) $(id).disabled = !ready;
+  $('auto-summary').disabled = $('auto-name').disabled = !ready || !automation;
+  $('auto-summary').checked = flags?.autoSummary === true; $('auto-name').checked = flags?.autoName === true;
+  $('generate-summary').disabled = !ready || !paper || !attempt && (!details?.endpoint?.hasApiKey || !text(details?.endpoint?.model));
+  $('generate-summary').textContent = busy && attempt ? '生成中…' : attempt ? '查询状态' : retryJob ? '重试生成' : text(metadata?.summary?.text).trim() ? '重新生成' : '生成';
+  $('generate-summary').title = attempt ? '仅查询状态，不重新发送 API' : retryJob ? '明确重试此任务，会再次调用一次 API' : '点击即授权本次 API 请求并保存摘要';
+  const proposed = paper ? proposedName() : '', revision = paper ? details?.entity?.locationRevision : details?.entity?.revision;
+  $('use-suggestion').disabled = !ready || !proposed; $('name-suggestion').textContent = proposed;
+  $('preview-name').disabled = !ready || !validLocalName($('new-name').value) || !Number.isInteger(revision);
+  $('confirm-rename').disabled = !ready || !renamePlan || (renamePlan.conflicts || []).length > 0;
+  $('dirty-state').textContent = changed() ? '未保存' : '';
+}
+function hydrateMetadata(value) {
+  if (!value || !Object.hasOwn(value, 'revision')) throw Error('元数据版本缺失，请重新打开。');
+  metadata = value;
+  if (details.kind === 'paper') {
+    $('summary-content').textContent = text(value.summary?.text) || '暂无摘要';
+    const b = value.bibliography || {}; $('bibliography').textContent = [text(b.firstAuthor) + (b.hasMoreAuthors ? '等' : ''), text(b.year), text(b.originalTitle)].filter(Boolean).join(' · ') || '暂无书目信息';
+  } else { $('editor').value = text(value.note); baseDraft = $('editor').value; }
+  $('conflict').hidden = $('reload-confirm').hidden = $('close-confirm').hidden = true;
+}
+function hydrateEntity(entity) { details.entity = entity; $('entity-name').textContent = text(entity.name); $('new-name').value = text(entity.name); }
+function showJobs(jobs) {
+  const list = Array.isArray(jobs) ? jobs : [], root = $('jobs'); root.replaceChildren(); $('jobs-section').hidden = !paperId || !list.length;
+  const labels = { queued: '等待中', running: '生成中', done: '已完成', 'needs-review': '版本待核对', failed: '失败', 'request-unknown': '结果未知', skipped: '已跳过' };
+  for (const job of list.slice(-20).reverse()) { const row = document.createElement('div'); row.className = 'job'; row.textContent = [labels[job.status] || '状态待确认', text(job.updatedAt), text(job.reason)].filter(Boolean).join(' · '); root.appendChild(row); }
+  const latest = list.filter(job => job.intent === 'manual-summary').at(-1);
+  retryJob = latest && ['failed', 'request-unknown'].includes(latest.status) ? latest : null;
+  if (!attempt && latest && ['queued', 'running'].includes(latest.status)) attempt = { operationId: latest.operationId, jobId: latest.jobId, phase: 'checking' };
+}
+async function load(preserve = false) {
+  const result = await api('/library/details?' + query);
+  if (result.kind !== (paperId ? 'paper' : 'collection') || result.entity?.[paperId ? 'paperId' : 'collectionId'] !== (paperId || collectionId)) throw Error('返回身份不一致，已停止操作。');
+  const keep = preserve && changed(); details = result; hydrateEntity(result.entity);
+  const paper = result.kind === 'paper'; $('heading').textContent = paper ? '论文摘要' : '文献库备注';
+  $('summary-section').hidden = !paper; $('collection-editor').hidden = paper; $('paper-section').hidden = $('suggestion-row').hidden = !paper;
+  $('name-label').textContent = paper ? '文件名（不含 .pdf）' : '库名称';
+  if (!keep) hydrateMetadata(result.metadata);
+  if (result.automation && Object.hasOwn(result.automation, 'revision')) automation = result.automation;
+  showJobs(result.jobs); updateControls(); return keep;
+}
+async function action(work) {
+  if (busy || disposed || !metadata) return;
+  busy = true; updateControls();
+  try { await work(); }
+  catch (error) { if (disposed) return; if (error.status === 409 && details?.kind === 'collection') $('conflict').hidden = false; status(error.status === 409 ? '版本已变化，请刷新后重试。' : error.name === 'AbortError' ? '请求中断，请核对任务状态。' : error.message, 'error'); }
+  finally { busy = false; if (!disposed) updateControls(); }
+}
+async function settleJob(job, current) {
+  if (disposed || attempt !== current) return;
+  if (!job || job.operationId !== current.operationId) throw Error('任务身份待核对。');
+  current.jobId = job.jobId;
+  if (['queued', 'running'].includes(job.status)) { current.phase = 'checking'; status('生成中…'); return; }
+  try { await load(true); }
+  catch {
+    if (attempt === current && !disposed) { current.phase = 'checking'; status(job.status === 'done' ? '已生成并保存；摘要刷新失败，请查询状态。' : '任务已结束；信息刷新失败，请查询状态。', 'warn'); }
+    return;
+  }
+  if (attempt !== current || disposed) return;
+  attempt = null;
+  status(job.status === 'done' ? '已生成并保存。' : job.status === 'request-unknown' ? '结果未知；重试会再次调用 API。' : job.status === 'needs-review' ? '摘要版本已变化，结果已保留待核对。' : '生成未完成，可明确重试。', job.status === 'done' ? '' : 'warn');
+  notify('dpr:paper-details-updated');
+}
+async function checkAttempt() {
+  const current = attempt, result = await api('/enrichment/jobs?paperId=' + encodeURIComponent(paperId));
+  if (disposed) return; showJobs(result.jobs);
+  if (current && attempt === current) {
+    const job = (Array.isArray(result.jobs) ? result.jobs : []).find(job => job.operationId === current.operationId);
+    if (job) await settleJob(job, current); else status('请求尚未确认；点击仅查询状态。', 'warn');
+  }
+  updateControls();
+}
+$('generate-summary').onclick = event => {
+  if (event?.isTrusted !== true) return;
+  return action(async () => {
+    if (details.kind !== 'paper') return;
+    if (attempt) { await checkAttempt(); return; }
+    const old = retryJob;
+    const current = { operationId: crypto.randomUUID(), expectedRevision: metadata.revision, phase: old ? 'dispatching' : 'planning' }; attempt = current; updateControls();
+    try {
+      let result;
+      if (old) result = await api('/enrichment/retry', { jobId: old.jobId, operationId: current.operationId, confirmCosts: true, intent: 'manual-summary', expectedRevision: current.expectedRevision });
+      else {
+        const { plan } = await api('/enrichment/plan', { paperId, features: ['summary'], intent: 'manual-summary', expectedRevision: current.expectedRevision });
+        if (!plan || !text(plan.planId) || plan.paperId !== paperId || plan.intent !== 'manual-summary' || plan.metadataRevision !== current.expectedRevision) throw Error('生成版本已变化，请刷新。');
+        current.planId = plan.planId; current.phase = 'dispatching';
+        result = await api('/enrichment/run', { planId: current.planId, operationId: current.operationId, confirmCosts: true, intent: 'manual-summary', expectedRevision: current.expectedRevision });
+      }
+      await settleJob(result.job, current);
+    } catch (error) {
+      if (attempt !== current || disposed) return;
+      if (current.phase === 'planning' || [400, 401, 403, 404, 409, 422].includes(error.status)) { attempt = null; throw error; }
+      current.phase = 'unknown'; status('请求结果待核对。', 'warn');
+      try { await checkAttempt(); } catch { status('请求结果待核对，稍后查询状态。', 'warn'); }
+    }
+  });
+};
+for (const [id, key] of [['auto-summary', 'autoSummary'], ['auto-name', 'autoName']]) $(id).addEventListener('change', event => {
+  const enabled = $(id).checked;
+  if (event?.isTrusted !== true || !automation || busy) { updateControls(); return; }
+  return action(async () => {
+    const next = { autoSummary: automation.autoSummary === true, autoName: automation.autoName === true, [key]: enabled }; pendingAutomation = next; updateControls();
+    try { const result = await api('/enrichment/automation', { revision: automation.revision, ...next, confirmCosts: enabled });
+      if (!result.automation || !Object.hasOwn(result.automation, 'revision')) throw Error('自动设置未确认，请刷新。');
+      automation = result.automation; status(''); notify('dpr:paper-details-updated');
+    } finally { pendingAutomation = null; }
+  });
+});
+$('editor').addEventListener('input', () => { allowUnload = false; updateControls(); });
+$('save-local').onclick = () => action(async () => {
+  if (details.kind !== 'collection') return;
+  const result = await api('/library/details', { collectionId, revision: metadata.revision, note: $('editor').value }); hydrateMetadata(result.metadata); status('已保存。'); notify('dpr:paper-details-updated');
+});
+$('copy-draft').onclick = async () => { if (details?.kind === 'collection') { try { await navigator.clipboard.writeText($('editor').value); status('已复制。'); } catch { $('editor').focus(); $('editor').select(); status('请按 Ctrl+C／⌘C 复制。'); } } };
+$('export-draft').onclick = () => {
+  if (details?.kind !== 'collection') return;
+  const url = URL.createObjectURL(new Blob([$('editor').value], { type: 'text/plain;charset=utf-8' }));
+  const link = document.createElement('a'); link.href = url; link.download = 'collection-note-' + collectionId + '.txt'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+$('reload-remote').onclick = () => { $('reload-confirm').hidden = false; };
+$('cancel-reload').onclick = () => { $('reload-confirm').hidden = true; };
+$('confirm-reload').onclick = () => action(async () => { await load(false); status('已载入远端版本。'); });
+$('refresh-details').onclick = () => action(async () => { const kept = await load(true); status(kept ? '已刷新，备注草稿保留。' : ''); });
+$('new-name').addEventListener('input', () => { renamePlan = null; $('rename-confirm').hidden = true; updateControls(); });
+$('use-suggestion').onclick = () => { const name = proposedName(); if (name) { $('new-name').value = name; renamePlan = null; $('rename-confirm').hidden = true; updateControls(); } };
+$('preview-name').onclick = () => action(async () => {
+  const expectedLocationRevision = details.kind === 'paper' ? details.entity.locationRevision : details.entity.revision;
+  if (!Number.isInteger(expectedLocationRevision) || !validLocalName($('new-name').value)) throw Error('请填写有效的库内名称。');
+  const { plan } = await api('/library/changes/plan', { ...identity, name: $('new-name').value.trim(), expectedLocationRevision });
+  if (!plan || !text(plan.planId) || plan.entityId !== (paperId || collectionId)) throw Error('改名计划身份无效。');
+  renamePlan = plan; $('rename-title').textContent = '确认改名为：' + text(plan.newName); $('rename-files').replaceChildren();
+  for (const file of plan.affectedFiles || []) { const item = document.createElement('li'); item.textContent = typeof file === 'string' ? file : '关联文件'; $('rename-files').appendChild(item); }
+  $('rename-effects').textContent = (plan.sessionEffects || []).filter(v => typeof v === 'string').join('\n');
+  $('rename-conflicts').textContent = (plan.conflicts || []).length ? '存在冲突，请调整名称。' : ''; $('rename-confirm').hidden = false; updateControls();
+});
+$('cancel-rename').onclick = () => { renamePlan = null; $('rename-confirm').hidden = true; updateControls(); };
+$('confirm-rename').onclick = () => action(async () => {
+  if (!renamePlan || (renamePlan.conflicts || []).length) return;
+  const plan = renamePlan; renamePlan = null; $('rename-confirm').hidden = true;
+  const result = await api('/library/changes/apply', { planId: plan.planId, operationId: crypto.randomUUID() });
+  if (!result.entity || result.entity[paperId ? 'paperId' : 'collectionId'] !== (paperId || collectionId)) throw Error('改名返回身份不一致。');
+  hydrateEntity(result.entity); status('名称已更新。'); notify('dpr:paper-details-updated');
+});
+function requestClose() { if (changed()) { $('close-confirm').hidden = false; $('cancel-close').focus(); return; } allowUnload = true; notify('dpr:paper-details-close'); }
+$('close-panel').onclick = requestClose;
+window.addEventListener('message', event => {
+  if (disposed || !validIdentity || event.origin !== location.origin || event.source !== parent || event.data?.type !== 'dpr:paper-details-request-close') return;
+  const key = paperId ? 'paperId' : 'collectionId', otherKey = paperId ? 'collectionId' : 'paperId';
+  if (event.data[key] !== identity[key] || Object.hasOwn(event.data, otherKey)) return;
+  requestClose();
+});
+window.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); requestClose(); } });
+$('cancel-close').onclick = () => { $('close-confirm').hidden = true; };
+$('confirm-close').onclick = () => { allowUnload = true; notify('dpr:paper-details-close'); };
+function stop() { disposed = true; clearTimeout(pollTimer); for (const controller of controllers) controller.abort(); }
+window.addEventListener('pagehide', stop, { once: true });
+window.addEventListener('beforeunload', event => { if (!allowUnload && changed()) { event.preventDefault(); event.returnValue = ''; } });
+async function pollJobs() {
+  if (disposed || !paperId) return;
+  try { if (!document.hidden) await checkAttempt(); } catch { /* GET polling never reissues a paid operation. */ }
+  finally { if (!disposed) pollTimer = setTimeout(pollJobs, 2000); }
+}
+(async () => {
+  if (!validIdentity) { status('文献身份无效，请重新打开。', 'error'); return; }
+  try { await load();
+    try { const result = await api('/enrichment/automation'); if (result.automation && Object.hasOwn(result.automation, 'revision')) automation = result.automation; } catch { automation = null; }
+    updateControls(); if (paperId) pollTimer = setTimeout(pollJobs, 2000);
+  } catch (error) { metadata = null; updateControls(); status(error.message, 'error'); }
+})();
+</script>
+</body>
+</html>

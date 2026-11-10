@@ -1,0 +1,527 @@
+// tools.ts — 工具注册（Cordis 壳；核心逻辑在 library/transcribe/search 纯函数里）。
+import { defineTool } from '@deepseek-ai/dsh-tools';
+import { getPaperRuntime } from './library-runtime.js';
+import { registerLibraryTools } from './library-tools.js';
+import { listPapers, listTopics, resolveDataDir, resolvePaper } from "./library.js";
+import { transcribePaper, readTranscript } from "./transcribe.js";
+import { chunkText, queryVariantsFor, searchChunksMulti, formatHits } from "./search.js";
+import { readTranscriptMeta } from "./transcribe.js";
+import { EMBED_DEFAULTS, embeddingsPathFor, embeddingRecallFor, fuseHybridCandidates } from "./embed.js";
+import { resolveEmbedConfig } from "./embed-config.js";
+import { resolveRerankClient, resolveShortlistSize, rerankHits } from "./rerank.js";
+import { completeStep, formatStudy, readStudy, recordQuiz, setPlan } from "./study.js";
+import { readerOrigin } from "./origin.js";
+import { resolveMineruConfig } from "./mineru-config.js";
+const MINERU_SOURCES = ['auto', 'pdfjs', 'mineru-local', 'mineru-cloud'];
+function sourceArg(v) {
+    return MINERU_SOURCES.includes(v) ? v : 'auto';
+}
+const locateParams = {
+    paperId: { type: 'string', description: '稳定论文 UUID；优先于旧路径或名称。' },
+    collectionId: { type: 'string', description: '稳定文献库 UUID；可与 name 配合定位嵌套库内论文。' },
+    path: { type: 'string', description: 'PDF 绝对路径。与 topic+name 二选一。' },
+    topic: { type: 'string', description: '专题名（文献库一级目录）。' },
+    name: { type: 'string', description: '文献名（不带 .pdf 后缀）。省略时自动使用当前会话绑定的论文（伴读会话），只有查询别的论文才需要显式指定。' },
+};
+function locate(dataDir, args, exec) {
+    const refArgs = Object.fromEntries(['paperId','collectionId','path','topic','name']
+        .filter(key => args[key] !== undefined).map(key => [key,args[key]]));
+    // Only the catalog's exact real-session binding supplies an implicit locator.
+    // Historical dpr encodings are migration input for Host, never a tool fallback.
+    if (!Object.keys(refArgs).length && exec?.agent?.id !== undefined)
+        refArgs.sessionId = exec.agent.id;
+    return resolvePaper(dataDir, refArgs);
+}
+/** 从伴读会话 id 反解论文（dpr-<base64url(topic/name)>[-N]）；非伴读会话返回 null。 */
+export function paperFromSessionId(sessionId) {
+    if (!sessionId?.startsWith('dpr-'))
+        return null;
+    try {
+        const body = sessionId.slice(4).replace(/-\d+$/, '');
+        const decoded = Buffer.from(body, 'base64url').toString('utf8');
+        const sep = decoded.indexOf('/');
+        if (sep <= 0 || sep === decoded.length - 1)
+            return null;
+        return { topic: decoded.slice(0, sep), name: decoded.slice(sep + 1) };
+    }
+    catch {
+        return null;
+    }
+}
+/** 某篇论文的阅读器链接基址（拼 &page=N 即跳转链接）；origin 未捕获到时为 null。 */
+function readerUrl(ref) {
+    const o = readerOrigin();
+    if (!o)
+        return null;
+    return `${o}/paper-reader/?${ref.paperId ? 'paperId='+encodeURIComponent(ref.paperId)+'&' : ''}topic=${encodeURIComponent(ref.topic)}&name=${encodeURIComponent(ref.name)}`;
+}
+/** 输出 schema 里的 readerUrl 字段声明（nullable：没有任何浏览器请求过时尚未捕获 origin）。 */
+const readerUrlSchema = {
+    oneOf: [{ type: 'string' }, { type: 'null' }],
+    required: true,
+    description: '阅读器链接基址。引用页码时在末尾拼 &page=N 生成跳转链接；要定位到具体段落再拼 &q=<该段落原文短引文，3~8个词，URL编码>，点击会高亮对应片段。为 null 时本次不带链接。',
+};
+/** render 文本尾部统一带出的链接基址行（preset 规定了用法，这里只暴露值）。 */
+const readerUrlLine = (url) => (url ? `\n阅读器链接基址：${url}` : '');
+/** 4 个 source 值的文案（§10.1：不得把 MinerU 结果误报成「本地提取」）。 */
+function sourceLabel(source) {
+    switch (source) {
+        case 'cache': return '缓存复用';
+        case 'local': return '本地提取(pdf.js)';
+        case 'mineru-local': return '本地 MinerU 解析';
+        case 'mineru-cloud': return '云端 MinerU 解析';
+        default: return source;
+    }
+}
+function producerLabel(producer) {
+    switch (producer) {
+        case 'pdfjs': return 'pdf.js';
+        case 'mineru-local': return '本地 MinerU';
+        case 'mineru-cloud': return '云端 MinerU';
+        default: return producer;
+    }
+}
+const identitySchema = {
+    paperId: { oneOf: [{ type:'string' },{ type:'null' }], required:true },
+    collectionId: { oneOf: [{ type:'string' },{ type:'null' }], required:true },
+};
+const identity = ref => ({ paperId:ref.paperId ?? null, collectionId:ref.collectionId ?? null });
+export function registerTools(ctx, config, {runtimeFactory=getPaperRuntime}={}) {
+    const dataDir = resolveDataDir(config.dataDir);
+    const runtime = runtimeFactory(dataDir,config);
+    const shortlistSize = resolveShortlistSize(config.typesafe);
+    ctx.tools.register(defineTool({
+        name: 'list_papers',
+        description: '列出文献库里的专题和文献。当用户提到某篇论文但你不知道它是否在库中、或用户问"我有哪些论文"时使用。',
+        parameters: {
+            topic: { type: 'string', description: '只看某个专题；省略则列出全部。' },
+            collectionId: { type: 'string', description: '按稳定文献库 UUID 筛选，优先于 topic。' },
+        },
+        output: {
+            schema: {
+                type: 'object',
+                properties: {
+                    dataDir: { type: 'string', required: true, description: '文献库根目录。' },
+                    paperEntries: { type:'array', required:true, items:{ type:'object', properties:{
+                        ...identitySchema,topic:{type:'string',required:true},name:{type:'string',required:true}
+                    },additionalProperties:false } },
+                    topics: {
+                        type: 'array',
+                        required: true,
+                        items: { type: 'string' },
+                        description: '专题列表。',
+                    },
+                    papers: {
+                        type: 'array',
+                        required: true,
+                        items: { type: 'string', description: '形如 专题/文献名' },
+                        description: '文献列表。',
+                    },
+                },
+                additionalProperties: false,
+            },
+            render: (_args, value) => [
+                {
+                    type: 'text',
+                    text: value.papers.length === 0
+                        ? `文献库为空（${value.dataDir}）。把 PDF 放进 <专题>/ 目录即可。`
+                        : `文献库（${value.dataDir}）：\n${value.papers.map((p) => `- ${p}`).join('\n')}\n稳定文献引用：${JSON.stringify(value.paperEntries)}`,
+                },
+            ],
+        },
+        execute: async (args, exec) => {
+            await runtime.ready;
+            exec.signal?.throwIfAborted();
+            const topic = args.collectionId !== undefined ? runtime.catalog.resolveCollection({collectionId:args.collectionId}).segments.join('/') : args.topic;
+            const entries = listPapers(dataDir, topic);
+            const papers = entries.map((p) => `${p.topic}/${p.name}`);
+            return { dataDir, topics: listTopics(dataDir), papers, paperEntries:entries.map(p=>({...identity(p),topic:p.topic,name:p.name})) };
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'transcribe_pdf',
+        description: '把一篇 PDF 论文转录为纯文本（默认本地 pdf.js 提取，带页码索引），结果落盘缓存。' +
+            '可指定 source=mineru-local/mineru-cloud 改走 MinerU 解析后端（本地/云端，适合扫描件）。' +
+            '读一篇新论文的第一步：先转录，再用 search_paper 检索。已有缓存时秒回。',
+        parameters: {
+            ...locateParams,
+            force: { type: 'boolean', description: '忽略缓存重新转录。' },
+            source: {
+                type: 'string',
+                enum: ['auto', 'pdfjs', 'mineru-local', 'mineru-cloud'],
+                description: '解析来源：auto=有缓存复用、无缓存按配置（默认 pdfjs）；pdfjs=本地 pdf.js 文本层；' +
+                    'mineru-local=本地 MinerU API；mineru-cloud=mineru.net v4 云端。',
+            },
+        },
+        output: {
+            schema: {
+                type: 'object',
+                properties: {
+                    ...identitySchema,
+                    paper: { type: 'string', required: true },
+                    txtPath: { type: 'string', required: true, description: '转录文本路径。' },
+                    chars: { type: 'integer', required: true },
+                    pageCount: { type: 'integer', required: true },
+                    hasPageIndex: { type: 'boolean', required: true, description: '是否有页码索引（检索结果能否带页码）。' },
+                    source: { type: 'string', required: true, enum: ['cache', 'local', 'mineru-local', 'mineru-cloud'] },
+                    producer: {
+                        type: 'string',
+                        required: true,
+                        enum: ['legacy', 'pdfjs', 'mineru-local', 'mineru-cloud'],
+                        description: '产出这份文本的引擎；legacy=旧缓存（缺来源标记，等价 pdfjs）。',
+                    },
+                    backend: {
+                        oneOf: [{ type: 'string' }, { type: 'null' }],
+                        required: true,
+                        description: '实际 MinerU backend（本地）或 modelVersion（云端）；非 MinerU 为 null。',
+                    },
+                    readerUrl: readerUrlSchema,
+                },
+                additionalProperties: false,
+            },
+            render: (_args, value) => [
+                {
+                    type: 'text',
+                    text: `已转录《${value.paper}》：${value.chars} 字符，${value.pageCount} 页` +
+                        `（${sourceLabel(value.source)}${value.hasPageIndex ? '，含页码索引' : '，无页码索引'}）。` +
+                        (value.source !== 'cache' && value.producer !== 'pdfjs' && value.producer !== 'legacy'
+                            ? ` 引擎：${producerLabel(value.producer)}${value.backend ? `（${value.backend}）` : ''}。`
+                            : '') +
+                        `接下来可用 search_paper 检索具体内容。` +
+                        readerUrlLine(value.readerUrl),
+                },
+            ],
+        },
+        execute: async (args, exec) => {
+            await runtime.ready;
+            exec.signal?.throwIfAborted();
+            const ref = locate(dataDir, args, exec);
+            const transcribe = async ref => {
+            const mineru = await resolveMineruConfig(config.mineru);
+            const t = await transcribePaper(ref, { force: args.force === true, source: sourceArg(args.source), mineru });
+            return {
+                ...identity(ref),
+                paper: `${ref.topic}/${ref.name}`,
+                txtPath: ref.txtPath,
+                chars: t.chars,
+                pageCount: t.pageCount,
+                hasPageIndex: t.pages.length > 0,
+                source: t.source,
+                producer: t.producer,
+                backend: t.backend,
+                readerUrl: readerUrl(ref),
+            };
+            };
+            return ref.paperId ? runtime.withPaperTask(ref.paperId,transcribe) : transcribe(ref);
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'search_paper',
+        description: '在论文全文中按关键词检索相关片段，返回带页码的原文片段。' +
+            '当需要论文的具体内容（定义、算法步骤、章节细节、数据）时使用，基于检索到的原文回答并注明页码。' +
+            '关键词建议：用论文中的英文术语、章节号（如 "Section 3.1"）或概念名，不要用完整长句；找不到时换同义词或更短的词重试。' +
+            '论文未转录时会自动先转录。' +
+            '（配置了嵌入端点时额外做语义召回；未配置则纯关键词，与改造前一致）',
+        parameters: {
+            query: { type: 'string', required: true, description: '检索关键词，如 "backup task" 或 "locality"。' },
+            k: { type: 'integer', description: '返回片段数量，默认 5，最多 8。' },
+            ...locateParams,
+        },
+        output: {
+            schema: {
+                type: 'object',
+                properties: {
+                    ...identitySchema,
+                    paper: { type: 'string', required: true },
+                    query: { type: 'string', required: true },
+                    totalChunks: { type: 'integer', required: true },
+                    reranked: {
+                        type: 'boolean',
+                        required: true,
+                        description: '返回片段是否经过语义重排（配置了 Jev/TypeSafe 凭据且候选充足时为 true）。',
+                    },
+                    compactQuery: {
+                        oneOf: [{ type: 'string' }, { type: 'null' }],
+                        required: true,
+                        description: '查询侧 LaTeX 紧凑写法（MinerU 来源论文才会一并匹配，如 Q_{t} → Q_t）；无需归一化时为 null。',
+                    },
+                    embedding: {
+                        type: 'object',
+                        required: true,
+                        description: '嵌入语义召回的状态：未配置时 configured=false 且不影响结果；降级时 degraded 给出原因。',
+                        properties: {
+                            configured: { type: 'boolean', required: true },
+                            used: { type: 'boolean', required: true },
+                            fromCache: { type: 'boolean', required: true },
+                            degraded: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true },
+                        },
+                        additionalProperties: false,
+                    },
+                    hits: {
+                        type: 'array',
+                        required: true,
+                        items: {
+                            type: 'object',
+                            properties: {
+                                chunk: { type: 'integer', required: true },
+                                page: {
+                                    oneOf: [{ type: 'integer' }, { type: 'null' }],
+                                    required: true,
+                                    description: '片段起始页码；无页码索引时为 null。',
+                                },
+                                text: { type: 'string', required: true },
+                            },
+                            additionalProperties: false,
+                        },
+                    },
+                    readerUrl: readerUrlSchema,
+                },
+                additionalProperties: false,
+            },
+            render: (_args, value) => {
+                const notes = [];
+                if (value.compactQuery) {
+                    notes.push(`（查询已按紧凑写法 \`${value.compactQuery}\` 一并匹配；原查询保留）`);
+                }
+                if (value.embedding.degraded) {
+                    notes.push(`（嵌入检索不可用，已降级为纯关键词：${value.embedding.degraded}）`);
+                }
+                else if (value.embedding.configured && value.embedding.used) {
+                    notes.push(value.embedding.fromCache ? '（含嵌入语义召回；分块向量命中缓存）' : '（含嵌入语义召回）');
+                }
+                return [
+                    {
+                        type: 'text',
+                        text: formatHits(value.hits.map((h) => ({
+                            chunk: { index: h.chunk, start: 0, end: 0, text: h.text },
+                            score: 0,
+                            page: h.page,
+                        })), value.totalChunks, value.query) +
+                            (notes.length ? '\n' + notes.join('\n') : '') +
+                            readerUrlLine(value.readerUrl),
+                    },
+                ];
+            },
+        },
+        execute: async (args, exec) => {
+            await runtime.ready;
+            exec.signal?.throwIfAborted();
+            const ref = locate(dataDir, args, exec);
+            const search = async ref => {
+            let cached = await readTranscript(ref);
+            if (!cached) {
+                const mineru = await resolveMineruConfig(config.mineru);
+                await transcribePaper(ref, { source: 'auto', mineru });
+                cached = await readTranscript(ref);
+            }
+            if (!cached)
+                throw new Error('转录失败，无法检索');
+            const chunks = chunkText(cached.text, 1500);
+            const k = Math.max(1, Math.min(args.k ?? 5, 8));
+            // 折叠项 1（查询侧 LaTeX 归一化）：投影侧只对 MinerU 产物做紧凑写法归一化，
+            // 因此查询侧的同名变体也**只对 MinerU 来源的论文**追加；原查询永远保留 →
+            // pdfjs/旧缓存论文既不丢命中也不引入新行为（与改造前逐字节一致）。
+            const producer = (await readTranscriptMeta(ref))?.producer ?? null;
+            const variants = queryVariantsFor(producer, args.query);
+            const compact = variants.length > 1 ? variants[1] : null;
+            // 关键词快搜捞 shortlist（宽召回）→ 可选语义召回 → 既有重排 → top-k。
+            // 凭据每次现查（设置面板保存即生效）；未配置时三段都退回纯关键词，行为与改造前一致。
+            const rerankClient = await resolveRerankClient(config.typesafe);
+            const embedCfg = await resolveEmbedConfig(config.embed);
+            const wideRecall = Boolean(rerankClient) || embedCfg.enabled;
+            const recallSize = wideRecall ? Math.max(k, shortlistSize) : k;
+            let hits = searchChunksMulti(chunks, cached.pages, variants, recallSize);
+            // 嵌入召回：惰性（首次检索该论文才算）+ 缓存（<论文>.embeddings.json）；失败只影响本次召回。
+            const embedding = await embeddingRecallFor({
+                configured: embedCfg.enabled,
+                cachePath: embeddingsPathFor(ref.txtPath),
+                chunks,
+                pages: cached.pages,
+                query: args.query,
+                chunkSize: 1500,
+                limit: embedCfg.cfg.candidateSize ?? EMBED_DEFAULTS.candidateSize,
+                ...(embedCfg.enabled
+                    ? {
+                        req: {
+                            baseUrl: embedCfg.cfg.baseUrl,
+                            apiKey: embedCfg.cfg.apiKey,
+                            model: embedCfg.cfg.model,
+                            ...(embedCfg.cfg.timeoutMs !== undefined ? { timeoutMs: embedCfg.cfg.timeoutMs } : {}),
+                        },
+                        ...(embedCfg.cfg.batchSize !== undefined ? { batchSize: embedCfg.cfg.batchSize } : {}),
+                    }
+                    : {}),
+            });
+            // 融合候选保持 RRF 相关性序直到最终选定 k 条，选定之后再恢复原文序展示（issue #13：
+            // 融合层若先按原文排序，下面 slice(0, k) 会按文档位置截取，把最相关的片段挤出去）。
+            const fused = embedding.hits.length > 0;
+            if (fused)
+                hits = fuseHybridCandidates(hits, embedding.hits, recallSize);
+            if (!wideRecall)
+                hits = hits.slice(0, k);
+            if (embedding.degraded) {
+                console.warn('[dsh-paper-reader] 嵌入检索降级为纯关键词:', embedding.degraded);
+            }
+            let reranked = false;
+            if (rerankClient && hits.length > k) {
+                try {
+                    hits = await rerankHits(rerankClient, args.query, hits, k, config.typesafe?.deadlineMs ?? 1500);
+                    reranked = true;
+                }
+                catch (e) {
+                    // 超预算/网络/鉴权任何失败都退回关键词 top-k（结果已算好，零成本降级）
+                    console.warn('[dsh-paper-reader] 检索重排失败，退回关键词排序:', e);
+                    hits = hits.slice(0, k);
+                }
+            }
+            if (!reranked)
+                hits = hits.slice(0, k);
+            // 展示序：融合路径在**选定 top-k 之后**恢复原文顺序（重排成功路径在 rerankHits 内部已做）；
+            // 纯关键词路径维持相关性序不变（既有行为，未配置嵌入/重排时逐字节一致）。
+            if (fused && !reranked)
+                hits = hits.slice().sort((a, b) => a.chunk.index - b.chunk.index);
+            return {
+                ...identity(ref),
+                paper: `${ref.topic}/${ref.name}`,
+                query: args.query,
+                totalChunks: chunks.length,
+                hits: hits.map((h) => ({ chunk: h.chunk.index, page: h.page, text: h.chunk.text })),
+                reranked,
+                compactQuery: compact,
+                embedding: {
+                    configured: embedding.configured,
+                    used: embedding.used,
+                    fromCache: embedding.fromCache,
+                    degraded: embedding.degraded,
+                },
+                readerUrl: readerUrl(ref),
+            };
+            };
+            return ref.paperId ? runtime.withPaperTask(ref.paperId,search) : search(ref);
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'study_progress',
+        description: '读取一篇论文的学习档案：分步阅读计划（每步状态）和历次检验成绩。' +
+            '开始伴读、或用户想继续学习/查看进度时先调用；没有记录时返回空，此时应制定计划（study_update 的 set_plan）。',
+        parameters: { ...locateParams },
+        output: {
+            schema: {
+                type: 'object',
+                properties: {
+                    ...identitySchema,
+                    paper: { type: 'string', required: true },
+                    hasRecord: { type: 'boolean', required: true },
+                    plan: {
+                        type: 'array',
+                        required: true,
+                        items: {
+                            type: 'object',
+                            properties: {
+                                id: { type: 'integer', required: true },
+                                title: { type: 'string', required: true },
+                                status: { type: 'string', required: true, enum: ['pending', 'current', 'done'] },
+                                note: { type: 'string' },
+                            },
+                            additionalProperties: false,
+                        },
+                    },
+                    quizzes: {
+                        type: 'array',
+                        required: true,
+                        items: {
+                            type: 'object',
+                            properties: {
+                                time: { type: 'string', required: true },
+                                score: { type: 'integer', required: true },
+                                total: { type: 'integer', required: true },
+                                summary: { type: 'string' },
+                            },
+                            additionalProperties: false,
+                        },
+                    },
+                    readerUrl: readerUrlSchema,
+                },
+                additionalProperties: false,
+            },
+            render: (_args, value) => [
+                {
+                    type: 'text',
+                    text: `《${value.paper}》学习档案：\n` + formatStudy(value.hasRecord ? { paper: value.paper, plan: value.plan, quizzes: value.quizzes } : null) + readerUrlLine(value.readerUrl),
+                },
+            ],
+        },
+        execute: async (args, exec) => {
+            await runtime.ready;
+            exec.signal?.throwIfAborted();
+            const ref = locate(dataDir, args, exec);
+            const progress = async ref => {
+            const record = await readStudy(ref);
+            return {
+                ...identity(ref),
+                paper: `${ref.topic}/${ref.name}`,
+                hasRecord: record !== null,
+                plan: record?.plan ?? [],
+                quizzes: record?.quizzes ?? [],
+                readerUrl: readerUrl(ref),
+            };
+            };
+            return ref.paperId ? runtime.withPaperWrite(ref.paperId,progress) : progress(ref);
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'study_update',
+        description: '更新一篇论文的学习档案（老师用）：' +
+            'set_plan=制定阅读计划（steps 为 3~6 个分步标题，会重置计划但保留历史成绩）；' +
+            'complete_step=当前步检查已通过后才可记录完成（step_id + 可选 note 点评，自动推进到下一步；未通过不得调用）；' +
+            'record_quiz=记录一次检验成绩（score/total + 可选 summary 薄弱点小结）。',
+        parameters: {
+            action: { type: 'string', required: true, enum: ['set_plan', 'complete_step', 'record_quiz'] },
+            steps: { type: 'array', items: { type: 'string' }, description: 'set_plan 用：分步标题列表，如 "读摘要与引言（第 1 页），说出论文要解决的问题"。' },
+            step_id: { type: 'integer', description: 'complete_step 用：完成的步骤号。' },
+            note: { type: 'string', description: 'complete_step 用：对学生这一步表现的点评。' },
+            score: { type: 'integer', description: 'record_quiz 用：得分。' },
+            total: { type: 'integer', description: 'record_quiz 用：满分。' },
+            summary: { type: 'string', description: 'record_quiz 用：本次检验小结（考点/薄弱点）。' },
+            ...locateParams,
+        },
+        output: {
+            schema: {
+                type: 'object',
+                properties: {
+                    ...identitySchema,
+                    paper: { type: 'string', required: true },
+                    summary: { type: 'string', required: true, description: '更新后的档案摘要。' },
+                },
+                additionalProperties: false,
+            },
+            render: (_args, value) => [{ type: 'text', text: `《${value.paper}》档案已更新：\n${value.summary}` }],
+        },
+        execute: async (args, exec) => {
+            await runtime.ready;
+            exec.signal?.throwIfAborted();
+            const ref = locate(dataDir, args, exec);
+            const update = async ref => {
+            let record;
+            if (args.action === 'set_plan') {
+                if (!args.steps?.length)
+                    throw new Error('set_plan 需要 steps');
+                record = await setPlan(ref, args.steps);
+            }
+            else if (args.action === 'complete_step') {
+                if (!args.step_id)
+                    throw new Error('complete_step 需要 step_id');
+                record = await completeStep(ref, args.step_id, args.note);
+            }
+            else {
+                if (args.score === undefined || args.total === undefined)
+                    throw new Error('record_quiz 需要 score 和 total');
+                record = await recordQuiz(ref, args.score, args.total, args.summary);
+            }
+            return { ...identity(ref), paper: `${ref.topic}/${ref.name}`, summary: formatStudy(record) };
+            };
+            return ref.paperId ? runtime.withPaperWrite(ref.paperId,update) : update(ref);
+        },
+    }));
+    registerLibraryTools(ctx,config,{runtimeFactory});
+}

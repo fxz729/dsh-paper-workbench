@@ -1,0 +1,3310 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="dpr-ui-csrf" content="__DPR_UI_CSRF__">
+<title>论文伴读 · dsh-paper-reader</title>
+<!-- pdf.js 6.x 本地 vendor（不再走 CDN）：3.11 的字体解析对 babeldoc 嵌入的 CID 字体会回退成黑体。
+     不用 <script type="module">：module 是 defer 语义（整页解析完 + 458KB 拉取编译完才执行），
+     而底部经典脚本在解析期就开跑 bootstrap()，库里有论文时先到 loadPdf，此刻 window.pdfjsLib
+     还没就绪 → "pdfjsLib is not defined"。改为经典脚本里动态 import()（见 ensurePdfjs），顺序有保证。 -->
+<!-- KaTeX 0.16.22 本地 vendor（数学渲染；论文伴读是**离线场景**，绝不引 CDN）。
+     经典脚本：页面解析期同步设置 window.katex；缺失时渲染路径会**降级**为原始 LaTeX（见 trRenderBody）。
+     体积与来源见 reader/vendor/katex.NOTICE.md。 -->
+<link rel="stylesheet" href="/paper-reader/vendor/katex.min.css">
+<script src="/paper-reader/vendor/katex.min.js"></script>
+<script src="/paper-reader/reader-sync.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e2e5ea; --text: #24292f;
+    --text-2: #656d76; --accent: #0969da; --accent-soft: rgba(9,105,218,.12);
+    --hl: rgba(255, 196, 0, .55);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { font: 14px/1.6 -apple-system, "SF Pro", "PingFang SC", "Helvetica Neue", sans-serif; background: var(--bg); color: var(--text); display: flex; flex-direction: column; }
+
+  /* ---------- 顶栏 ----------
+     flex-wrap —— 窄列（rightbar 可拖到 ~300px）下按钮放不下时换行到第二行，
+     而不是向右溢出被 iframe 裁掉（v1.3.2 前的坑：＋/适宽 被挤出可视区，用户实测） */
+  #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; row-gap: 6px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border); flex: none; }
+  #bar button { font: inherit; }
+  /* flex:none —— 列被拖窄时按钮不许被压缩（否则文字竖排、按钮变窄条） */
+  /* inline-flex + 固定高：图标/文字统一垂直居中，按钮高度不再随各家字体字形漂移 */
+  .tbtn { flex: none; display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 28px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer; }
+  .tbtn:hover { background: var(--bg); }
+  .tbtn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .tbtn:disabled { opacity: .45; cursor: default; }
+  /* 统一 SVG 图标：stroke=currentColor，active/disabled 的变色自动继承到图标 */
+  .tbtn svg.ic { width: 16px; height: 16px; flex: none; }
+  .tbtn svg.spin { transform-origin: center; animation: dpr-spin 1s linear infinite; }
+  @keyframes dpr-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .tbtn svg.spin { animation-duration: 2.4s; } }
+  #zoom-label { flex: none; min-width: 44px; text-align: center; color: var(--text-2); }
+  #bar .spacer { flex: 1; }
+  /* min-width:0 —— flex 项默认 min-width:auto 会拒绝收缩，空间不够时转而去挤按钮；
+     让标题自己截断（已有 ellipsis），按钮才能保持原样 */
+  #status { flex: 0 1 auto; min-width: 0; color: var(--text-2); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* 翻译进度条（只在生成中文版时出现）：细长条 + 阶段文字，宽度跟着 babeldoc 的 overall 走 */
+  #zh-prog { flex: 0 1 auto; min-width: 0; max-width: 46%; display: inline-flex; align-items: center; gap: 7px; }
+  #zh-prog[hidden] { display: none; }
+  #zh-prog .track { position: relative; flex: 1 1 auto; min-width: 48px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  #zh-prog .fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; border-radius: 3px; background: var(--accent); transition: width .35s ease; }
+  #zh-prog .txt { flex: none; font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (prefers-reduced-motion: reduce) { #zh-prog .fill { transition: none; } }
+  /* PDF 文件路径：可点的只读文本（点击复制）。⚠️ 必须可收缩（flex:0 1 auto + min-width:0）——
+     它是最长的内容项，窄列时先让位给按钮、自己截断（title 悬停始终有完整路径），
+     曾经 max-width:34% + flex:none 在窄列把 ＋/适宽 挤出可视区（用户实测） */
+  #pdf-path { flex: 0 1 auto; min-width: 0; max-width: 34%; padding: 0; border: none; background: none; color: var(--text-2); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+  #pdf-path:hover { color: var(--accent); }
+  /* 窄列（<560px）：版本号让位——它只是排障辅助信息 */
+  @media (max-width: 560px) { #ver { display: none; } }
+
+  /* ---------- PDF 区 ---------- */
+  /* #split-wrap 是分屏（模式 B）的两列行容器：非分屏时只有原文列，行为与改造前一致。
+     #pdf-pane 从 #main 的直接子节点变成它的子节点——#main 的 flex 语义不变。 */
+  #main { display: flex; flex: 1; min-height: 0; position: relative; } /* relative：公式面板绝对定位的锚 */
+  #split-wrap { display: flex; flex-direction: row; gap: 8px; flex: 1; min-width: 0; }
+  #pdf-pane { flex: 1 1 0; min-width: 0; overflow: auto; padding: 16px; }
+  /* 中文列（仅分屏出现）：与原文列同权重、各自滚动 */
+  #pdf-pane-zh { flex: 1 1 0; min-width: 0; overflow: auto; padding: 16px; display: none; }
+  #split-wrap.on > #pdf-pane-zh { display: block; }
+  .pane-label { display: none; position: sticky; top: -16px; z-index: 3; background: var(--bg); color: var(--text-2);
+    font-size: 12px; font-weight: 600; padding: 2px 0 6px; }
+  #split-wrap.on .pane-label { display: block; }
+  /* safe center：页宽超过视口时退回左对齐——普通 center 会让左右同时溢出且左侧滚不到 */
+  #pdf-pages { display: flex; flex-direction: column; align-items: safe center; gap: 14px; }
+  #pdf-pages-zh { display: flex; flex-direction: column; align-items: safe center; gap: 14px; }
+  /* 翻页模式：单页垂直居中（safe center 同理，放大后顶部仍可滚到） */
+  #pdf-pages.paged, #pdf-pages-zh.paged { min-height: 100%; justify-content: safe center; gap: 0; }
+
+  /* ---------- 翻页控件 ---------- */
+  #pager { display: flex; align-items: center; gap: 4px; flex: none; }
+  /* 数字居中：text-align:right 会让单页码贴右框边、左侧空一块；
+     上 padding 多 1px —— 数字无下伸部，光字心本就偏高，对称内边距看起来反而偏上 */
+  #page-input { width: 3.5em; padding: 4px 6px 2px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; font-size: 12.5px; line-height: 20px; text-align: center; }
+  #page-total { flex: none; color: var(--text-2); font-size: 12px; white-space: nowrap; }
+  /* 插件版本号（host 注入；未被替换时隐藏——比如旧 host 配新页面的错位场景） */
+  #ver { flex: none; font-size: 10.5px; color: var(--text-2); opacity: .65; user-select: none; }
+  .page { position: relative; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.18); }
+  .page.flash { outline: 3px solid var(--hl); outline-offset: 2px; transition: outline .15s; }
+  /* textLayer CSS 必须是 pdf.js 6.x 官方规则的子集：TextLayer 只往 span 写 --font-height/--scale-x/--rotate
+     变量，font-size 和 transform 全靠这里的 calc 表达式撑开；缺了的话 span 会按 body 字号渲染，
+     盒子与 canvas 字形错位 —— 表现为选中高亮缺字符。--scale-factor 由 JS 在渲染时写入 */
+  .textLayer {
+    position: absolute; inset: 0; overflow: clip; line-height: 1; text-align: initial;
+    letter-spacing: normal; word-spacing: normal; text-size-adjust: none;
+    forced-color-adjust: none; transform-origin: 0 0; caret-color: CanvasText; z-index: 0;
+    --total-scale-factor: calc(var(--scale-factor, 1) * var(--user-unit, 1));
+    --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size, 1));
+    --min-font-size-inv: calc(1 / var(--min-font-size, 1));
+    --scale-round-x: 1px; --scale-round-y: 1px;
+  }
+  .textLayer :is(span, br) { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0 0; user-select: text; }
+  .textLayer > :not(.markedContent),
+  .textLayer .markedContent span:not(.markedContent) {
+    z-index: 1;
+    --font-height: 0;
+    font-size: calc(var(--text-scale-factor) * var(--font-height));
+    --scale-x: 1; --rotate: 0deg;
+    transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+  }
+  .textLayer .markedContent { display: contents; }
+  .textLayer ::selection { background: rgba(22,93,255,.3); }
+  .textLayer br::selection { background: transparent; }
+  /* 跳转链接的片段高亮（&q= 引文定位）：常驻不淡出，用户在阅读器里任意点一下即消
+     （同代码编辑器的选中高亮语义：消失由用户触发，不由计时器触发） */
+  .textLayer span.dpr-hl { background: rgba(255,196,0,.45); border-radius: 2px; }
+  #empty { margin: 60px auto; color: var(--text-2); text-align: center; max-width: 420px; }
+
+  /* ---------- 公式引用（MinerU bbox 热区 + 列表面板）----------
+     契约 §1.3/§1.4：热区**不用** pointer-events:auto 的覆盖层——那会夺走 textLayer 的
+     mousedown/拖拽，破坏既有划词提问。这里 .eqLayer 只负责画描边（pointer-events:none），
+     命中判定在 JS 里按坐标算。 */
+  .eqLayer { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+  .eq-box { position: absolute; border-radius: 3px; }
+  .eq-box.hover { outline: 1.5px dashed rgba(9,105,218,.85); background: rgba(9,105,218,.07); }
+  .eq-box.hit { outline: 2px solid rgba(255,140,0,.9); background: rgba(255,196,0,.16); }
+  #eq-panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(320px, 88%); display: none;
+    background: var(--panel); border-left: 1px solid var(--border); box-shadow: -4px 0 16px rgba(0,0,0,.08);
+    overflow: auto; z-index: 3; padding: 10px 12px; }
+  #eq-panel h3 { margin: 0 0 4px; font-size: 13px; }
+  #eq-meta { font-size: 11.5px; color: var(--text-2); margin-bottom: 6px; line-height: 1.5; }
+  .eq-page { margin: 10px 0 2px; font-size: 12px; font-weight: 600; color: var(--text-2); }
+  .eq-item { display: block; width: 100%; text-align: left; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); padding: 6px 8px; margin: 4px 0; cursor: pointer; font: inherit; }
+  .eq-item:hover { border-color: var(--accent); }
+  .eq-item code { display: block; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px;
+    white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+  .eq-item .eq-tag { font-size: 11px; color: var(--text-2); }
+  #eq-note { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  #eq-transcribe { margin-top: 8px; }
+  #eq-toggle.muted { opacity: .55; }
+  #ask-copy { background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--text-2); cursor: pointer; margin-right: auto; }
+
+  /* ---------- 在文中查找（顶栏 🔍 / Ctrl+F）----------
+     输入框与结果列表在**同一个浮窗**里：窗口可拖动、可拖边框改大小，开关只有窗口一件事，
+     不再有「输入条」和「结果面板」两套入口。页内高亮是 .findLayer 里的百分比盒子
+     （Range.getClientRects 算出来的词级矩形）：不给 span 加背景类——span 常常是一整行，
+     而且加类会动 textLayer 的换行与划词。 */
+  #find-tools { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border); flex: none; }
+  #find-input { flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font: inherit;
+    font-size: 12.5px; line-height: 18px; background: var(--panel); color: var(--text); }
+  #find-input:focus { outline: none; border-color: var(--accent); }
+  #find-count { flex: none; min-width: 44px; max-width: 96px; text-align: center; font-size: 12px; color: var(--text-2);
+    font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #find-count.hit { color: var(--accent); }
+  #find-count:empty { display: none; }
+  /* 查找浮窗：输入行 + 结果列表装在一起，可拖动、可拖边框改大小，默认 330×340，不占满阅读区。
+     旧版用右侧滑出面板占满整列高度，会遮住半页纸，所以改成浮窗。 */
+  #find-window { position: fixed; z-index: 46; display: none; flex-direction: column; width: 330px; height: 340px;
+    min-width: 240px; min-height: 190px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+  #find-window.on { display: flex; }
+  #find-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; cursor: move; user-select: none;
+    border-bottom: 1px solid var(--border); font-size: 12.5px; font-weight: 600; flex: none; }
+  #find-head .spacer { flex: 1; }
+  #find-headcount { font-weight: 400; color: var(--text-2); font-variant-numeric: tabular-nums; }
+  #find-meta { padding: 6px 10px 2px; font-size: 11.5px; color: var(--text-2); line-height: 1.5; flex: none; }
+  /* 列表自己滚：头部与说明固定在窗口上沿，关按钮永远在最上面看得见 */
+  #find-list { flex: 1; overflow: auto; padding: 2px 8px 10px; }
+  #find-grip { position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize; z-index: 2; }
+  #find-grip::after { content: ''; position: absolute; right: 3px; bottom: 3px; width: 8px; height: 8px;
+    border-right: 2px solid var(--text-2); border-bottom: 2px solid var(--text-2); border-bottom-right-radius: 3px; opacity: .55; }
+  /* 右边缘 / 下边缘也能拖：整条边都是热区，不用非得瞄准右下角那 16px */
+  #find-grip-r { position: absolute; top: 68px; right: 0; bottom: 16px; width: 6px; cursor: ew-resize; z-index: 2; }
+  #find-grip-b { position: absolute; left: 0; right: 16px; bottom: 0; height: 6px; cursor: ns-resize; z-index: 2; }
+  .tbtn.mini { height: 24px; padding: 0 6px; border-radius: 5px; }
+  .tbtn.mini svg.ic { width: 14px; height: 14px; }
+  #find-window .tbtn.mini.on { border-color: var(--accent); color: var(--accent); }
+  .find-page { margin: 10px 0 2px; font-size: 12px; font-weight: 600; color: var(--text-2); }
+  .find-item { display: block; width: 100%; text-align: left; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); padding: 5px 8px; margin: 3px 0; cursor: pointer;
+    font: inherit; font-size: 12px; line-height: 1.5; }
+  .find-item:hover { border-color: var(--accent); }
+  .find-item.cur { border-color: var(--accent); background: var(--accent-soft); }
+  .find-item mark { background: rgba(255,196,0,.55); color: inherit; border-radius: 2px; padding: 0 1px; }
+  .findLayer { position: absolute; inset: 0; pointer-events: none; z-index: 3; }
+  .find-box { position: absolute; border-radius: 2px; background: rgba(255,214,0,.45); }
+  .find-box.cur { background: rgba(255,146,0,.55); box-shadow: 0 0 0 1.5px rgba(230,110,0,.85); }
+  /* 兜底高亮：Range 几何算不出来时给 span 加类（宁可糙一点，也不能「搜到了却看不见」） */
+  .textLayer span.find-hit { background: rgba(255,214,0,.45); border-radius: 2px; }
+  .textLayer span.find-hit.cur { background: rgba(255,146,0,.55); }
+
+  /* ---------- 选中即问浮层 ---------- */
+  #ask-pop { position: fixed; z-index: 50; display: none; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.16); padding: 10px; width: 320px; }
+  #ask-quote { font-size: 12px; color: var(--text-2); max-height: 64px; overflow: hidden; margin-bottom: 8px; border-left: 3px solid var(--accent-soft); padding-left: 8px; }
+  #ask-input { width: 100%; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; resize: none; }
+  #ask-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  #ask-send { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 5px 14px; cursor: pointer; }
+  #ask-send:disabled { opacity: .5; cursor: default; }
+  #ask-cancel { background: none; border: none; color: var(--text-2); cursor: pointer; }
+  /* 「译」动作按钮（加法：只在原文视图的纯文字选区出现，见 showAskPop） */
+  #ask-translate { background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--accent); cursor: pointer; }
+
+  /* ---------- 划词译文气泡 ----------
+     用户明确要求：**只显示译文**，不做「插入会话」「复制」按钮 ⇒ 气泡内部零 button 元素。
+     提示（诚实降级文案）走独立的 #tr-note，绝不混进 #tr-body。 */
+  #tr-pop { position: fixed; z-index: 50; display: none; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.16); padding: 10px;
+    width: min(360px, calc(100vw - 16px)); max-height: 45vh; overflow: auto; }
+  #tr-status { font-size: 12px; color: var(--text-2); }
+  #tr-status:empty { display: none; }
+  #tr-body { font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+  #tr-note { font-size: 12px; color: var(--text-2); margin-top: 6px; line-height: 1.5; }
+  #tr-note:empty { display: none; }
+  /* 公式段：KaTeX 渲染进我们新建的元素（.tr-math / .tr-math-block）；渲染失败时该段落回原始 LaTeX
+     文本并加 .tr-math-fallback（可读可复制，绝不留白）。 */
+  #tr-body .tr-math-block { margin: 6px 0; overflow-x: auto; }
+  #tr-body .tr-math-block .katex-display { margin: 0; }
+  #tr-body .tr-math-fallback { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--text-2); word-break: break-all; }
+
+  /* ---------- 翻译端点设置浮层 ---------- */
+  /* 阅读器在窄 iframe 里，宽度要能收缩 */
+  #cfg-pop { position: fixed; z-index: 60; display: none; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.16); padding: 10px; width: min(320px, calc(100vw - 32px)); }
+  #cfg-pop h3 { margin: 0; font-size: 13px; }
+  #cfg-hint { font-size: 12px; color: var(--text-2); margin: 4px 0 2px; }
+  #cfg-pop label { display: block; font-size: 12px; color: var(--text-2); margin: 8px 0 2px; }
+  #cfg-pop input, #cfg-pop select { width: 100%; border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; background: var(--panel); color: var(--text); }
+  #cfg-model-hint, #cfg-source { font-size: 11.5px; color: var(--text-2); margin-top: 4px; line-height: 1.5; }
+  #cfg-source:empty { display: none; }
+  #cfg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+  #cfg-save { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 5px 14px; cursor: pointer; }
+  #cfg-save:disabled { opacity: .5; cursor: default; }
+  #cfg-cancel { background: none; border: none; color: var(--text-2); cursor: pointer; }
+
+  #toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); background: rgba(30,30,30,.92); color: #fff; padding: 8px 16px; border-radius: 8px; font-size: 13px; display: none; z-index: 99; max-width: 70%; }
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <span id="status">论文伴读</span>
+  <!-- 翻译进度条：只在 babeldoc 跑着时出现（宽度=overall，文字=阶段+百分比），
+       窄列下先让位给按钮（flex:0 1 auto + min-width:0），别把控件挤出去 -->
+  <span id="zh-prog" hidden><span class="track"><span class="fill"></span></span><span class="txt"></span></span>
+  <button id="pdf-path" style="display:none" title="点击复制文件路径"></button>
+  <button id="zh-toggle" class="tbtn" title="切换中文译文（没有译文时可生成）" style="display:none" data-icon="translate"></button>
+  <button id="dual-toggle" class="tbtn" title="用 babeldoc 的中英对照 PDF（模式 A）" style="display:none" data-icon="columns">对照</button>
+  <button id="split-toggle" class="tbtn" title="原文与中文版并排同步滚动（模式 B）" style="display:none" data-icon="split">分屏</button>
+  <!-- 「同步滚动」开关（模式 B 的全局偏好）：分屏控件旁，只在分屏下可见（模式 A/原文/译文都没有两个滚动条）。
+       状态换图标（sync / syncOff，与 mode-toggle 的 paged/scroll 同法）+ title 里 zh/en 说明状态；
+       与设置面板里的同一项共用 dpr.syncScroll 键、互相同步。 -->
+  <button id="sync-toggle" class="tbtn" title="同步滚动 / Sync scroll：开（两列一起滚，点击关闭）" style="display:none" data-icon="sync"></button>
+  <button id="zh-regen" class="tbtn" title="重新翻译：删除现有译文，用当前端点重跑（换模型后用）" style="display:none" data-icon="regen"></button>
+  <button id="dl-btn" class="tbtn" title="下载 PDF" style="display:none" data-icon="download"></button>
+  <!-- 在文中查找（Ctrl+F）：入口紧挨下载，实际输入条是浮层，不占顶栏宽度 -->
+  <button id="find-open" class="tbtn" title="在文中查找（Ctrl+F）" style="display:none" data-icon="search"></button>
+  <span class="spacer"></span>
+  <button id="mode-toggle" class="tbtn" title="切换 滚动/翻页模式" style="display:none" data-icon="paged"></button>
+  <span id="pager" style="display:none">
+    <button id="page-prev" class="tbtn" title="上一页" data-icon="prev"></button>
+    <input id="page-input" type="text" inputmode="numeric" title="页码，回车跳转">
+    <span id="page-total">/ ?</span>
+    <button id="page-next" class="tbtn" title="下一页" data-icon="next"></button>
+  </span>
+  <button id="details-open" class="tbtn" type="button" title="论文摘要与书目" disabled>摘要</button>
+  <button id="cfg-open" class="tbtn" title="翻译端点设置" data-icon="settings"></button>
+  <button id="zoom-out" class="tbtn" title="缩小" data-icon="minus"></button>
+  <span id="zoom-label" title="Ctrl＋鼠标滚轮缩放 PDF">100%</span>
+  <button id="zoom-in" class="tbtn" title="放大" data-icon="plus"></button>
+  <button id="zoom-fit" class="tbtn">适宽</button>
+  <button id="eq-toggle" class="tbtn" title="公式引用（MinerU LaTeX）" data-icon="sigma">公式</button>
+  <span id="ink-actions"></span>
+  <span id="ver" title="插件版本">__DPR_VERSION__</span>
+</div>
+
+<div id="main">
+  <div id="split-wrap">
+    <div id="pdf-pane">
+      <div id="pane-label" class="pane-label">原文</div>
+      <div id="pdf-pages"></div>
+      <div id="empty" style="display:none"></div>
+    </div>
+    <div id="pdf-pane-zh">
+      <div id="pane-label-zh" class="pane-label">中文</div>
+      <div id="pdf-pages-zh"></div>
+    </div>
+  </div>
+  <div id="eq-panel">
+    <h3>公式</h3>
+    <div id="eq-meta"></div>
+    <div id="eq-list"></div>
+  </div>
+  <!-- 查找：输入框与结果列表在同一个浮窗里（可拖动 / 拖边框改大小 / 精简↔全部，
+       位置尺寸记在 localStorage）。头部固定，只有 #find-list 自己滚，所以关按钮永远可见。 -->
+  <div id="find-window" role="dialog" aria-label="查找">
+    <div id="find-head">
+      <span>查找</span>
+      <span id="find-headcount"></span>
+      <span class="spacer"></span>
+      <button id="find-expand" class="tbtn mini" title="在「精简」与「全部」之间切换">精简</button>
+      <button id="find-window-close" class="tbtn mini" title="关闭（Esc）">✕</button>
+    </div>
+    <div id="find-tools">
+      <input id="find-input" type="text" placeholder="在文中查找…" autocomplete="off" spellcheck="false">
+      <span id="find-count"></span>
+      <button id="find-prev" class="tbtn mini" title="上一处（Shift+Enter）" data-icon="prev"></button>
+      <button id="find-next" class="tbtn mini" title="下一处（Enter）" data-icon="next"></button>
+    </div>
+    <div id="find-meta"></div>
+    <div id="find-list"></div>
+    <div id="find-grip-r" title="拖动改变宽度"></div>
+    <div id="find-grip-b" title="拖动改变高度"></div>
+    <div id="find-grip" title="拖动调整大小"></div>
+  </div>
+</div>
+
+<div id="ask-pop">
+  <div id="ask-quote"></div>
+  <textarea id="ask-input" rows="2" placeholder="围绕选中内容提问…"></textarea>
+  <div id="ask-actions">
+    <button id="ask-copy" style="display:none">复制 LaTeX</button>
+    <button id="ask-translate" style="display:none" title="翻译选中内容（含公式时用 MinerU 的 LaTeX 还原）">译</button>
+    <button id="ask-cancel">取消</button>
+    <button id="ask-send">提问</button>
+  </div>
+</div>
+
+<!-- 划词译文气泡：只有译文 + 状态行 + 一行诚实提示，**零按钮**（用户明确不要插入会话/复制） -->
+<div id="tr-pop">
+  <div id="tr-status"></div>
+  <div id="tr-body"></div>
+  <div id="tr-note"></div>
+</div>
+
+<div id="cfg-pop">
+  <h3>翻译端点</h3>
+  <div id="cfg-hint">选预设供应商，或选「自定义」填任意 OpenAI 兼容端点（通义 / 本地 vLLM 等）。保存前会先测试连接。</div>
+  <div id="cfg-source"></div>
+  <label for="cfg-provider">供应商</label>
+  <select id="cfg-provider"></select>
+  <label for="cfg-url">端点 URL</label>
+  <input id="cfg-url" type="text" placeholder="https://api.deepseek.com/v1" autocomplete="off">
+  <label for="cfg-key">API Key</label>
+  <input id="cfg-key" type="password" placeholder="sk-..." autocomplete="new-password">
+  <label for="cfg-model">模型</label>
+  <input id="cfg-model" type="text" placeholder="deepseek-chat" autocomplete="off" list="cfg-model-list">
+  <datalist id="cfg-model-list"></datalist>
+  <div id="cfg-model-hint">glm-5.x / k3 / deepseek-flash 是推理型模型，服务端已自动关闭思考；选自定义端点时建议用非推理模型，否则会慢好几倍。</div>
+  <div id="cfg-actions">
+    <button id="cfg-cancel">取消</button>
+    <button id="cfg-save">保存</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+'use strict';
+/* ================= 基础 ================= */
+/* DOCK READER CONTEXT */
+const dockParams = new URLSearchParams(location.search);
+const readerDock = dockParams.getAll('dock').length === 1 && dockParams.get('dock') === '1';
+const dockTarget = readerDock && dockParams.getAll('workspaceSessionId').length === 1 ? dockParams.get('workspaceSessionId') : null;
+const workspaceSessionId = typeof dockTarget === 'string' && dockTarget.trim() && dockTarget.length <= 256 && !/[\u0000-\u001f\u007f]/.test(dockTarget) ? dockTarget : null;
+if (readerDock) document.documentElement.dataset.readerDock = 'true';
+function readerAskContext(ref) {
+  if (readerDock) {
+    if (!workspaceSessionId) throw Error('当前聊天身份无效，请从右栏重新打开文献');
+    const csrf = document.querySelector('meta[name="dpr-ui-csrf"]')?.content;
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(csrf || '')) throw Error('页面授权已失效，请重新打开右栏文献');
+    return { body: { workspaceSessionId }, headers: { 'x-dpr-ui-csrf': csrf } };
+  }
+  const n = +(localStorage.getItem(`dpr.sessionN.${ref.topic}/${ref.name}`) || 0) || undefined;
+  return { body: n ? { n } : {}, headers: {} };
+}
+function rememberReader(ref) { if (!readerDock) localStorage.setItem('dpr.last', JSON.stringify(ref)); }
+/* END DOCK READER CONTEXT */
+const $ = (id) => document.getElementById(id);
+/* DOCK READER CONTROLS */
+function initReaderDismiss() {
+  if (window._dprDismissInstalled) return;
+  window._dprDismissInstalled = true;
+  const closeOutside = target => {
+    for (const node of document.querySelectorAll('#dock-reader-more[open],#dock-reader-native[open],.dpr-ink-more[open]')) if (!target || !node.contains(target)) node.open = false;
+    const close = (id, trigger, action) => { const node = document.getElementById(id); if (!node || node.getClientRects().length === 0 || (target && (node.contains(target) || document.getElementById(trigger)?.contains(target)))) return; action(node); };
+    close('cfg-pop', 'cfg-open', () => closeCfgPop());
+    close('find-window', 'find-open', () => findClose());
+    close('eq-panel', 'eq-toggle', node => { node.style.display = 'none'; $('eq-toggle').classList.remove('active'); });
+    close('annotation-panel', 'annotation-open', node => node.classList.remove('on'));
+    close('ask-pop', '', node => { node.style.display = 'none'; });
+    close('tr-pop', '', () => hideTrPop());
+  };
+  document.addEventListener('pointerdown', event => closeOutside(event.target), true);
+  document.addEventListener('focusin', event => closeOutside(event.target), true);
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeOutside(null); }, true);
+  window.addEventListener('blur', () => closeOutside(null));
+}
+function initDockReader() {
+  if (!readerDock || document.getElementById('dock-reader-more')) return;
+  const bar = document.getElementById('bar');
+  const group = (className, ids) => { const node = document.createElement('div'); node.className = className; for (const id of ids) { const control = document.getElementById(id); if (control) node.appendChild(control); } bar.appendChild(node); return node; };
+  const navigation = document.createElement('div'); navigation.className = 'dock-reader-navigation';
+  navigation.appendChild(group('dock-reader-nav', ['pager']));
+  navigation.appendChild(group('dock-reader-zoom', ['zoom-out','zoom-label','zoom-in','zoom-fit']));
+  bar.appendChild(navigation);
+  const disclosure = (id, label) => { const node = document.createElement('details'); node.id = id; const summary = document.createElement('summary'); summary.textContent = label; summary.setAttribute('aria-label', label); node.appendChild(summary); node.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); node.open = false; summary.focus(); } }); return node; };
+  const more = disclosure('dock-reader-more', '阅读选项');
+  const panel = group('dock-reader-more-panel', ['details-open','zh-toggle','dual-toggle','split-toggle','sync-toggle','zh-regen','dl-btn','find-open','mode-toggle','cfg-open','eq-toggle','pdf-path','ver']);
+  more.appendChild(panel);bar.appendChild(more);
+  const tools = document.getElementById('reader-tools');
+  if (tools) { const native = disclosure('dock-reader-native', 'PDF 批注与交互'); const content = document.createElement('div'); while (tools.firstChild) content.appendChild(tools.firstChild); native.appendChild(content); tools.appendChild(native); }
+}
+/* END DOCK READER CONTROLS */
+/* 顶栏图标：统一的 24×24 描边图标集（stroke=currentColor，active/disabled 变色自动跟随按钮）。
+   曾经混用 Unicode 字符（↻/⤓/▣/⚙/＋…）——各自渲染自不同字体，粗细、大小、基线互不一致。 */
+const ICONS = {
+  translate: '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>',
+  regen: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+  paged: '<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
+  scroll: '<path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/>',
+  prev: '<path d="m15 18-6-6 6-6"/>',
+  next: '<path d="m9 18 6-6-6-6"/>',
+  settings: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  minus: '<path d="M5 12h14"/>',
+  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  sigma: '<path d="M18 7V5H6l6 7-6 7h12v-2"/>',
+  columns: '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>',
+  split: '<rect width="8" height="18" x="3" y="3" rx="2"/><rect width="8" height="18" x="13" y="3" rx="2"/>',
+  sync: '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  syncOff: '<path d="m18.84 12.25 1.72-1.71h-.02a5.004 5.004 0 0 0-.12-7.07 5.006 5.006 0 0 0-6.95 0l-1.72 1.71"/><path d="m5.17 11.75-1.71 1.71a5.004 5.004 0 0 0 .12 7.07 5.006 5.006 0 0 0 6.95 0l1.71-1.71"/><line x1="8" x2="8" y1="2" y2="5"/><line x1="2" x2="5" y1="8" y2="8"/><line x1="16" x2="16" y1="19" y2="22"/><line x1="19" x2="22" y1="16" y2="16"/>',
+  spin: '<path d="M21 12a9 9 0 1 1-6.219-8.56"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-3.9-3.9"/>',
+  close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+};
+const iconHtml = (name) => `<svg class="ic${name === 'spin' ? ' spin' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+// 静态按钮按 data-icon 注入一次；动态按钮（翻译/重翻/模式切换）在状态变化时用同一函数换图标
+document.querySelectorAll('#bar [data-icon], #find-window [data-icon]').forEach((b) => b.insertAdjacentHTML('afterbegin', iconHtml(b.dataset.icon)));
+const api = (p, opts) => fetch('/paper-reader/api' + p, opts).then(async (r) => {
+  if (!r.ok) {
+    // 服务端错误体有两种：{error}（参数/权限）与 {reason}（zh/generate 的未启动原因，带完整说明）
+    const body = await r.json().catch(() => ({}));
+    const err = new Error(body.error || body.reason || ('HTTP ' + r.status));
+    err.code = body.code;   // 机器可读码（如 no-endpoint）——让调用方靠它分支，别去匹配中文文案
+    err.status = r.status;
+    // 划词翻译的 502 带上游状态码：客户端据此出 §3.7② 的分档文案（拒绝/限流/端点错误），
+    // 而不是去 match 服务端的自由文案。
+    err.upstreamStatus = body.upstreamStatus;
+    throw err;
+  }
+  return r.json();
+});
+function toast(msg, ms = 3200) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.style.display = 'none', ms);
+}
+function esc(s) { return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+// 路径复制：与「复制 LaTeX」共用同一个 copyText（剪贴板写入只有一处实现，见文件末尾定义）
+$('pdf-path').onclick = async () => {
+  const p = $('pdf-path').textContent;
+  if (!p) return;
+  toast((await copyText(p)) ? '路径已复制' : '复制失败，路径见按钮悬停提示');
+};
+
+let current = null;        // public canonical identity; never an absolute filesystem path
+let readerSync = null;
+let zhState = { zh: false, dual: false, busy: false };
+let statusMeta = ''; // openPaper 的「name · N 页」基线，翻译阶段标签褪去后恢复它
+let zhVariant = null;      // null=原文 'dual'=中英对照 'zh'=纯中文（**分屏 split 也是 null**，见 C17）
+// 视图模式：四个控件（中/对照/分屏）挂在同一个状态上，互斥（§4.3）。
+// 'split'（模式 B）刻意让 zhVariant 保持 null —— 这样 eqHotEnabled()/公式面板文案/fitMode
+// 等既有分支继续按「原文」工作，零改动。
+let viewMode = 'orig';     // 'orig' | 'zh' | 'dual' | 'split'
+// 每篇论文记住上次用的语言版本：伴读会话的跳转链接原地跳页不重载，
+// 加上这里的恢复，「中文界面跳中文」在同篇跳转/重开/跨论文三条路径上都成立
+const variantKey = (topic, name, paperId) => paperId ? `dpr.variant.id.${paperId}` : `dpr.variant.${topic}/${name}`;
+
+// 阅读模式：scroll=连续滚动（默认，原行为）paged=单页翻页；每读者记忆
+let pageMode = localStorage.getItem('dpr.pageMode') === 'paged' ? 'paged' : 'scroll';
+// 当前页：paged 是唯一渲染依据；scroll 由 IntersectionObserver 跟随回写（模式切换/跳页共享）
+let curPage = 1;
+/* READING POSITION */
+let readingPositionRestoring=false,readingPositionTimer=null,readingRestore=null;
+function readingPositionKey(){return current?.paperId?'dpr.reader.position.v1.'+current.paperId+'.'+viewMode:null;}
+function readReadingPosition(){
+  try{const key=readingPositionKey(),row=key&&JSON.parse(localStorage.getItem(key)||'null');return row&&Number.isInteger(row.page)&&row.page>0&&Number.isFinite(row.ratio)&&row.ratio>=0&&row.ratio<=1&&(!row.left||Number.isFinite(row.left)&&row.left>=0)?row:null;}catch{return null;}
+}
+function saveReadingPosition(){
+  if(!readerDock||readingPositionRestoring||!current?.paperId||!pdfDoc)return;
+  const pane=$('pdf-pane');if(!pane.clientHeight)return;
+  const anchor=captureScrollAnchor(pane,$('pdf-pages')),key=readingPositionKey();if(!key)return;
+  const row={page:pageMode==='paged'?curPage:anchor.page||curPage,ratio:pageMode==='paged'?0:Math.max(0,Math.min(1,anchor.ratio||0)),left:pane.scrollLeft,viewMode};
+  if(viewMode==='split'){const zhPane=$('pdf-pane-zh');row.zh=captureScrollAnchor(zhPane,$('pdf-pages-zh'));row.zh.left=zhPane.scrollLeft;}
+  try{localStorage.setItem(key,JSON.stringify(row));}catch{}
+}
+function scheduleReadingPosition(){clearTimeout(readingPositionTimer);readingPositionTimer=setTimeout(saveReadingPosition,200);}
+function restoreReadingPosition(){
+  if(!readingRestore)return;const row=readingRestore;readingRestore=null;
+  if(pageMode!=='paged'){restoreScrollAnchor($('pdf-pane'),$('pdf-pages'),row);$('pdf-pane').scrollLeft=row.left||0;
+    if(viewMode==='split'&&row.zh){restoreScrollAnchor($('pdf-pane-zh'),$('pdf-pages-zh'),row.zh);$('pdf-pane-zh').scrollLeft=row.zh.left||0;}}
+  curPage=Math.min(row.page,pdfDoc?.numPages||row.page);updatePager();
+}
+/* END READING POSITION */
+
+/* ================= 打开文献 ================= */
+function readerReference() { return window.DprReaderSync.reference(current); }
+function readerQuery() { return new URLSearchParams(readerReference()).toString(); }
+function pdfUrl(variant) {
+  return `/paper-reader/api/pdf?${readerQuery()}${variant ? '&variant=' + variant : ''}&t=${Date.now()}`;
+}
+function applyCanonicalRef(value) {
+  const next = window.DprReaderSync.canonicalRef(value, current?.paperId || value.paperId);
+  if (current?.paperId && next.paperId !== current.paperId) throw Error('当前文献身份已变化');
+  const previous = current ? { ...current } : null;
+  window.DprInk?.adoptIdentity?.(next, previous);
+  current = next;
+  const oldPref = previous && localStorage.getItem(variantKey(previous.topic, previous.name));
+  const stablePref = variantKey(next.topic, next.name, next.paperId);
+  if (localStorage.getItem(stablePref) === null && oldPref !== null && oldPref !== undefined) localStorage.setItem(stablePref, oldPref);
+  rememberReader(current);
+  const url = new URL(location.href); url.searchParams.set('paperId', next.paperId); url.searchParams.delete('topic'); url.searchParams.delete('name');
+  history.replaceState(null, '', url);
+  const relative = [next.topic, next.name + '.pdf'].filter(Boolean).join(' / ');
+  $('pdf-path').textContent = relative; $('pdf-path').title = relative + '（库内位置，点击复制）'; $('pdf-path').style.display = '';
+  $('details-open').disabled = false;
+  const separator = statusMeta.indexOf(' ·');
+  if (separator >= 0) { statusMeta = next.name + statusMeta.slice(separator); $('status').textContent = statusMeta; }
+  if (parent !== window) parent.postMessage({ type: 'dpr:reader-canonical', paperId: next.paperId, ref: next }, location.origin);
+}
+async function startReaderSync() {
+  if (!current?.paperId || readerSync?.paperId === current.paperId) return;
+  if (readerSync) await readerSync.stop();
+  const sync = window.DprReaderSync.createReaderSync({ paperId: current.paperId,
+    getInk: () => window.DprInk ? {
+      prepareMutation: async operationId => {
+        await window.DprInk.prepareMutation(operationId);
+        // Public PDF.js API caches pending ranges before a physical move; no reload/store reset.
+        await Promise.all([pdfDoc?.getData(), pdfDocZh?.getData()]);
+      }, resumeMutation: operationId => window.DprInk.resumeMutation(operationId),
+      suspendSync: () => window.DprInk.suspendSync(), rejoinSync: () => window.DprInk.rejoinSync(), resumeSync: () => window.DprInk.resumeSync(),
+    } : null,
+    applyCanonical: applyCanonicalRef, onError: () => toast('阅读器同步未完成，保存保护保持；请保留当前页面核对', 6000),
+  });
+  readerSync = sync;
+  try { await sync.start(); } catch { toast('阅读器同步暂不可用，编辑已保护；正在重试本地同步', 6000); }
+}
+window.addEventListener('pagehide', () => { void readerSync?.stop(); }, { once: true });
+window.addEventListener('message', async event => {
+  if (event.origin !== location.origin || event.source !== parent || event.data?.type !== 'dpr:reader-identity') return;
+  const ref = event.data.ref;
+  if (!window.DprReaderSync.validId(ref?.paperId) || !current || (current.paperId ? current.paperId !== ref.paperId : current.topic !== ref.topic || current.name !== ref.name)) return;
+  const expected = current;
+  try {
+    const canonical = await api('/paper?paperId=' + encodeURIComponent(ref.paperId));
+    if (current !== expected) return;
+    applyCanonicalRef(window.DprReaderSync.canonicalRef(canonical, ref.paperId)); await startReaderSync();
+  } catch { toast('文献身份同步未完成，当前阅读保持不变', 5000); }
+});
+$('details-open').onclick = () => {
+  if (!current?.paperId) return;
+  const paperId = current.paperId, dialog = document.createElement('dialog'), frame = document.createElement('iframe');
+  dialog.setAttribute('aria-label', '论文摘要与书目');
+  Object.assign(dialog.style, { width: 'min(940px,96vw)', height: '94vh', maxWidth: '96vw', padding: '0', border: '1px solid var(--border)', borderRadius: '10px', background: 'var(--panel)' });
+  frame.title = '论文摘要与书目'; frame.src = '/paper-reader/paper-details.html?paperId=' + encodeURIComponent(paperId);
+  Object.assign(frame.style, { width: '100%', height: '100%', border: '0', display: 'block' });
+  const onMessage = async event => {
+    if (!window.DprReaderSync.acceptDetailsMessage(event, { origin: location.origin, source: frame.contentWindow, paperId })) return;
+    if (event.data.type === 'dpr:paper-details-close') dialog.close();
+    else {
+      if (parent !== window) parent.postMessage({ type: 'dpr:paper-details-updated', paperId }, location.origin);
+      // Rename completion is reconciled only by ReaderGate resume; details never unlock ink.
+    }
+  };
+  const requestClose = () => frame.contentWindow?.postMessage({ type: 'dpr:paper-details-request-close', paperId }, location.origin);
+  dialog.addEventListener('cancel', event => { event.preventDefault(); requestClose(); });
+  dialog.addEventListener('pointerdown', event => { const box = dialog.getBoundingClientRect(); if (event.target === dialog && (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom)) requestClose(); });
+  const close = () => { window.removeEventListener('message', onMessage); dialog.remove(); $('details-open').focus(); };
+  dialog.addEventListener('close', close, { once: true }); window.addEventListener('message', onMessage);
+  dialog.appendChild(frame); document.body.appendChild(dialog); dialog.showModal();
+};
+
+async function openPaper(topic, name, opts = {}) {
+  if (!name && !opts.paperId) return;
+  invalidateTranslate(); // Invalidate old selection responses before awaiting ink persistence.
+  saveReadingPosition();
+  await window.DprInk?.beforeNavigate?.();
+  readingPositionRestoring=true;
+  try {
+  const requested = opts.paperId ? { paperId: opts.paperId } : current?.paperId && current.topic === topic && current.name === name ? { paperId: current.paperId } : { topic, name };
+  const meta = await api('/paper?' + new URLSearchParams(window.DprReaderSync.reference(requested)));
+  const next = meta.paperId ? window.DprReaderSync.canonicalRef(meta, requested.paperId || meta.paperId) : { topic: meta.topic || topic, name: meta.name || name };
+  current = next; topic = current.topic; name = current.name;
+  if (current.paperId) applyCanonicalRef(current);
+  await startReaderSync();
+  // R-01/N-01：换文献的在飞译文必须**立刻**失效——必须放在本函数第一处 await 之前。
+  // 原来它在三次 await（`/api/paper`、`refreshZhState`、`loadFormulas`）之后，落在那几个窗口里
+  // 到达的旧响应仍会点亮气泡（t8 复审 N-01：P-A3 实测 seq 2→3 时气泡已显示上一篇译文）。
+  rememberReader(current);
+  curPage = opts.page || 1; // 换论文从第一页（或跳转目标页）开始；变体切换/重译不走这里，页码保持
+  $('status').textContent = '加载 PDF…';
+  statusMeta = meta.hasTranscript
+    ? `${name} · ${meta.pageCount ?? '?'} 页`
+    : `${name} · 未转录（提问时会自动转录）`;
+  $('status').textContent = statusMeta;
+  // Only the canonical public relative location is displayed, never a server absolute path.
+  const pathBtn = $('pdf-path');
+  pathBtn.textContent = [topic, name + '.pdf'].filter(Boolean).join(' / ');
+  pathBtn.title = pathBtn.textContent + '（库内位置，点击复制）'; pathBtn.style.display = '';
+  await refreshZhState();
+  // 恢复该论文上次的视图模式（持久化复用同一个键，取值域扩到 'split'；见 §4.3）
+  const saved = localStorage.getItem(variantKey(topic, name, current.paperId)) ?? localStorage.getItem(variantKey(topic, name));
+  viewMode = viewModeFromSaved(saved, zhState);
+  if (saved && viewMode === 'orig') localStorage.setItem(variantKey(topic, name, current.paperId), ''); // 非空但不可用 → 回写空（防脏值）
+  zhVariant = viewMode === 'zh' ? 'zh' : viewMode === 'dual' ? 'dual' : null; // split → null
+  readingRestore=readerDock&&!opts.page?readReadingPosition():null;
+  curPage=opts.page||readingRestore?.page||1;
+  $('zh-toggle').classList.toggle('active', zhVariant !== null);
+  // 译文版页宽与原文不同（对照双栏≈2×），分屏每列只有一半宽 ⇒ 都先进适宽
+  if (zhVariant || viewMode === 'split') { fitMode = true; fitBtn.classList.add('active'); }
+  // 公式索引（MinerU content_list）：**必须在 loadPdf 之前到货**——热区是在 paintPage 里
+  // 按 eqIndex 铺的，先渲染会漏画/残留上一篇的矩形；又必须排在 zhVariant 定稿之后——
+  // eqHotEnabled()/renderEqPanel() 都按 zhVariant 决定「译文视图关热区」。失败不影响打开文献。
+  await loadFormulas();
+  updateDlBtn();
+  updateViewButtons();
+  if (viewMode === 'split') {
+    await openSplit(); // 内部自己拉原文 + -zh.pdf 两个文档
+  } else {
+    // R-02：原地换文献时**无条件**退掉分屏（幂等）——否则新论文有 -zh.pdf、而持久化视图又不是
+    // split 时，refreshZhState 的回落守卫不触发，中文列会留着**上一篇**的 PDF（pdfDocZh 也不释放）。
+    teardownSplit();
+    await loadPdf(pdfUrl(zhVariant));
+  }
+  restoreReadingPosition();
+  if (opts.page) jumpTo(opts.page, opts.q); // Explicit navigation wins over remembered position.
+  } finally { readingPositionRestoring=false; window.DprInk?.didNavigate?.(); }
+}
+
+/* ================= 下载/导出 ================= */
+// 下载当前正在看的那个版本（原文/纯中文/中英对照）——导出译文的主要入口
+function updateDlBtn() {
+  const btn = $('dl-btn');
+  const findBtn = $('find-open');
+  if (!current) {
+    btn.style.display = 'none';
+    if (findBtn) findBtn.style.display = 'none';
+    return;
+  }
+  btn.style.display = '';
+  if (findBtn) findBtn.style.display = '';
+  btn.title = zhVariant === 'zh' ? '下载：纯中文版 PDF'
+    : zhVariant === 'dual' ? '下载：中英对照版 PDF' : '下载：原文 PDF';
+}
+function downloadCurrent() {
+  if (!current) return;
+  // 同源请求自动带 cookie（鉴权围栏）；download 属性空值 → 文件名取 content-disposition
+  const a = document.createElement('a');
+  a.href = pdfUrl(zhVariant) + '&download=1';
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+$('dl-btn').onclick = downloadCurrent;
+
+/* ================= 在文中查找（顶栏 🔍 / Ctrl+F）=================
+   索引来自 pdf.js 的 getTextContent 而**不是** DOM：翻页/分屏模式 DOM 里只有当前页，
+   只查 DOM 会漏掉其它页的命中。归一化口径与 highlightSnippet 一致（忽略空白、连字符、
+   软连字符与大小写），论文跨行断词（dis-tributed）也能命中。
+   页内高亮不给 span 加背景类（span 常常是一整行，加类还会动 textLayer 的换行与划词），
+   改用 Range.getClientRects() 在 .findLayer 里画百分比盒子：精确到词、缩放后自动对齐、
+   不吃鼠标事件（pointer-events:none，划词提问照旧）。 */
+const FIND_MAX_HITS = 2000;   // 防御：极端查询（单个字母）不至于把面板撑爆
+const FIND_WIN_KEY = 'dpr.findWin';       // 结果窗口的位置与尺寸（localStorage）
+const FIND_EXPAND_KEY = 'dpr.findExpand'; // 精简/全部（1 = 全部）
+const FIND_COMPACT_HITS = 30; // 精简模式列多少处
+const findInputEl = $('find-input');
+const findCountEl = $('find-count');
+let find = { q: '', needle: '', hits: [], idx: -1, index: null, doc: null, building: false, shown: false, listStale: true, expand: false };
+let findTimer = null;
+let findWin = { x: null, y: null, w: 330, h: 340 };  // x/y 为 null = 还没定位过（贴 🔍 下方）
+const findWinEl = $('find-window');
+try { find.expand = localStorage.getItem(FIND_EXPAND_KEY) === '1'; } catch { /* 隐私模式：默认精简 */ }
+
+/** 归一化 + 回原串索引：丢掉空白/连字符/软连字符并转小写（map[i] = 归一化串第 i 字符在原文的位置） */
+function findNorm(str) {
+  let nh = '';
+  const map = [];
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i].toLowerCase();
+    if (/\s/.test(c) || c === '-' || c === '­') continue;
+    nh += c;
+    map.push(i);
+  }
+  return { nh, map };
+}
+
+/** 一页的文本索引：text 保留空格（给结果列表做上下文片段），nh/map 用于匹配 */
+async function findPageIndex(n) {
+  const page = await pdfDoc.getPage(n);
+  const tc = await page.getTextContent();
+  // item 之间补空格：pdf.js 把同一行的单词切成多个 item，直接拼会粘连成 "theenclave"
+  const text = tc.items.map((it) => it.str || '').join(' ').replace(/\s+/g, ' ').trim();
+  const { nh, map } = findNorm(text);
+  return { text, nh, map };
+}
+
+async function findBuildIndex() {
+  if (!pdfDoc) return;
+  if (find.index && find.doc === pdfDoc) return;
+  const doc = pdfDoc;
+  find.doc = doc;
+  find.index = new Map();
+  find.building = true;
+  const total = doc.numPages;
+  for (let n = 1; n <= total; n++) {
+    if (find.doc !== doc) return;   // 索引期间换了文档/变体：这份索引作废
+    try { find.index.set(n, await findPageIndex(n)); } catch { find.index.set(n, null); }
+    updateFindCount(`索引 ${n}/${total}`);
+    if (n % 8 === 0) await new Promise((r) => setTimeout(r, 0));   // 让出主线程，别卡住滚动
+  }
+  find.building = false;
+}
+
+/** 上下文片段：命中前后各留一段，去掉首尾空白并把偏移跟着挪 */
+function findSnippet(text, start, end) {
+  const pad = 42;
+  let a = Math.max(0, start - pad);
+  let b = Math.min(text.length, end + pad);
+  while (a < start && /\s/.test(text[a])) a++;
+  while (b > end && /\s/.test(text[b - 1])) b--;
+  return { pre: a > 0, post: b < text.length, text: text.slice(a, b), hitStart: start - a, hitEnd: end - a };
+}
+
+/** 扫全篇收集命中（按页、按出现顺序），每处带「该页内第几个」序号（高亮时要对号入座） */
+function findCollect() {
+  find.hits = [];
+  find.idx = -1;
+  const needle = find.needle;
+  if (!needle || !find.index) return;
+  for (const [page, e] of find.index) {
+    if (!e || !e.nh) continue;
+    let from = 0;
+    let ord = 0;
+    for (;;) {
+      if (find.hits.length >= FIND_MAX_HITS) return;
+      const at = e.nh.indexOf(needle, from);
+      if (at < 0) break;
+      const start = e.map[at];
+      const end = e.map[at + needle.length - 1] + 1;
+      find.hits.push({ page, ord, snippet: findSnippet(e.text, start, end) });
+      ord += 1;
+      from = at + Math.max(1, needle.length);
+    }
+  }
+}
+
+function updateFindCount(note) {
+  if (!findCountEl) return;
+  findCountEl.classList.remove('hit');
+  if (note) { findCountEl.textContent = note; findCountEl.title = ''; return; }
+  if (!find.q || !find.needle) { findCountEl.textContent = ''; findCountEl.title = ''; return; }
+  if (find.building) { findCountEl.textContent = '索引…'; return; }
+  if (!find.hits.length) {
+    findCountEl.textContent = '无匹配';
+    findCountEl.title = '没有找到这段文字。扫描件没有文本层时也搜不到';
+    return;
+  }
+  // idx < 0 = 还没跳过（边打边搜阶段）：显示总处数，别让用户看到 "0/12"
+  findCountEl.textContent = find.idx < 0 ? `${find.hits.length} 处` : `${find.idx + 1}/${find.hits.length}`;
+  findCountEl.classList.add('hit');
+  findCountEl.title = `共 ${find.hits.length} 处（Enter 下一处，Shift+Enter 上一处）`;
+}
+
+function findMetaText() {
+  if (!find.q) return '输入关键词：Enter 跳到第一处，Shift+Enter 上一处，Esc 关闭。';
+  if (!find.needle) return '';
+  if (find.building && !find.hits.length) return '正在建立索引…';
+  if (!find.hits.length) {
+    return `没有找到「${find.q}」。如果这篇是扫描件（没有文本层）就会搜不到，可先用转录或 MinerU 解析再试。`;
+  }
+  const pages = new Set(find.hits.map((h) => h.page)).size;
+  const capped = find.hits.length >= FIND_MAX_HITS ? `（已截断到前 ${FIND_MAX_HITS} 处）` : '';
+  return `「${find.q}」共 ${find.hits.length} 处，分布在 ${pages} 页${capped}。点条目直接跳转。`;
+}
+
+/* ---------- 结果窗口：可拖动、可拖边框缩放、可精简/全部 ---------- */
+function findWinSave() {
+  if (!findWinEl) return;
+  try {
+    const r = findWinEl.getBoundingClientRect();
+    localStorage.setItem(FIND_WIN_KEY, JSON.stringify({
+      x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height),
+    }));
+  } catch { /* 隐私模式记不住：下次回到默认位置，不影响本次使用 */ }
+}
+
+function findWinLoad() {
+  if (!findWinEl) return;
+  try {
+    const raw = JSON.parse(localStorage.getItem(FIND_WIN_KEY) || 'null');
+    if (raw) {
+      if (Number.isFinite(raw.w)) findWin.w = Math.max(240, Math.min(720, raw.w));
+      if (Number.isFinite(raw.h)) findWin.h = Math.max(190, raw.h);
+      if (Number.isFinite(raw.x) && Number.isFinite(raw.y)) { findWin.x = raw.x; findWin.y = raw.y; }
+    }
+  } catch { /* 坏 JSON：用默认值 */ }
+}
+
+/** 落位并夹在视口内（窗口拖动/缩放/视口变化后都走这里，保证不会拖到屏幕外找不回来） */
+function findWinPlace() {
+  if (!findWinEl) return;
+  const w = findWin.w;
+  const h = Math.min(findWin.h, Math.max(190, window.innerHeight - 40));
+  let x = findWin.x;
+  let y = findWin.y;
+  if (x === null || y === null) {
+    // 首次打开：贴在 🔍 按钮下方（用户点的那颗按钮旁边最符合直觉）；按钮没显出来就贴右上角
+    const btn = $('find-open');
+    const r = btn ? btn.getBoundingClientRect() : null;
+    if (r && r.width) {
+      x = r.right - w;
+      y = r.bottom + 6;
+    } else {
+      x = window.innerWidth - w - 26;
+      y = 64;
+    }
+  }
+  x = Math.max(8, Math.min(x, window.innerWidth - w - 8));
+  y = Math.max(8, Math.min(y, window.innerHeight - h - 8));
+  findWinEl.style.width = w + 'px';
+  findWinEl.style.height = h + 'px';
+  findWinEl.style.left = Math.round(x) + 'px';
+  findWinEl.style.top = Math.round(y) + 'px';
+  findWin.x = Math.round(x);
+  findWin.y = Math.round(y);
+}
+
+function findWinShow(on) {
+  if (!findWinEl) return;
+  if (!on) {
+    findWinEl.classList.remove('on');
+    find.shown = false;
+    return;
+  }
+  findWinEl.classList.add('on');
+  find.shown = true;
+  findWinPlace();
+  renderFindList();
+}
+
+/** 精简模式只列当前命中附近的一段，避免几百处命中把窗口刷成冗长清单 */
+function findVisibleIdx() {
+  const n = find.hits.length;
+  const out = [];
+  if (find.expand || n <= FIND_COMPACT_HITS) {
+    for (let i = 0; i < n; i++) out.push(i);
+    return out;
+  }
+  const center = find.idx < 0 ? 0 : find.idx;
+  let start = Math.max(0, center - Math.floor(FIND_COMPACT_HITS / 2));
+  if (start + FIND_COMPACT_HITS > n) start = Math.max(0, n - FIND_COMPACT_HITS);
+  for (let i = start; i < start + FIND_COMPACT_HITS; i++) out.push(i);
+  return out;
+}
+
+function findSetExpand(on) {
+  find.expand = on;
+  try { localStorage.setItem(FIND_EXPAND_KEY, on ? '1' : '0'); } catch { /* 忽略 */ }
+  find.listStale = true;
+  renderFindList();
+}
+
+/** 重建结果列表（只在查询/模式变化时做；跳转只切 .cur 类，不重建 DOM） */
+function renderFindList() {
+  const list = $('find-list');
+  const meta = $('find-meta');
+  const head = $('find-headcount');
+  if (!list || !meta || !head) return;
+  meta.textContent = findMetaText();
+  head.textContent = !find.q || !find.needle ? ''
+    : !find.hits.length ? '无匹配'
+    : find.idx < 0 ? `${find.hits.length} 处` : `${find.idx + 1}/${find.hits.length}`;
+  const expBtn = $('find-expand');
+  if (expBtn) {
+    expBtn.style.display = find.hits.length > FIND_COMPACT_HITS ? '' : 'none';
+    // 按钮写的是「点了会变成什么」：精简时显示「全部」，全部时显示「精简」
+    expBtn.textContent = find.expand ? '精简' : '全部';
+    expBtn.classList.toggle('on', find.expand);
+    expBtn.title = find.expand ? `当前列出全部 ${find.hits.length} 处，点击收成精简` : `当前只列 ${FIND_COMPACT_HITS} 处，点击展开全部 ${find.hits.length} 处`;
+  }
+  if (!find.listStale && list.childElementCount) { syncFindCurrent(); return; }
+  find.listStale = false;
+  list.innerHTML = '';
+  if (!find.hits.length) return;
+  const frag = document.createDocumentFragment();
+  const shown = findVisibleIdx();
+  let lastPage = 0;
+  for (const i of shown) {
+    const hit = find.hits[i];
+    if (hit.page !== lastPage) {
+      const ph = document.createElement('div');
+      ph.className = 'find-page';
+      ph.textContent = `第 ${hit.page} 页`;
+      frag.appendChild(ph);
+      lastPage = hit.page;
+    }
+    const s = hit.snippet;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'find-item';
+    btn.dataset.i = String(i);
+    if (s.pre) btn.appendChild(document.createTextNode('…'));
+    btn.appendChild(document.createTextNode(s.text.slice(0, s.hitStart)));
+    const mk = document.createElement('mark');
+    mk.textContent = s.text.slice(s.hitStart, s.hitEnd);
+    btn.appendChild(mk);
+    btn.appendChild(document.createTextNode(s.text.slice(s.hitEnd)));
+    if (s.post) btn.appendChild(document.createTextNode('…'));
+    btn.addEventListener('click', () => { void findGoto(i); });
+    frag.appendChild(btn);
+  }
+  if (shown.length < find.hits.length) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'find-item';
+    more.style.textAlign = 'center';
+    more.style.color = 'var(--text-2)';
+    more.textContent = `还有 ${find.hits.length - shown.length} 处没有列出 · 点这里展开全部`;
+    more.addEventListener('click', () => findSetExpand(true));
+    frag.appendChild(more);
+  }
+  list.appendChild(frag);
+  syncFindCurrent();
+}
+
+function syncFindCurrent() {
+  const list = $('find-list');
+  if (!list) return;
+  let cur = null;
+  list.querySelectorAll('.find-item').forEach((el) => {
+    const on = Number(el.dataset.i) === find.idx;
+    el.classList.toggle('cur', on);
+    if (on) cur = el;
+  });
+  if (cur) cur.scrollIntoView({ block: 'nearest' });
+}
+
+function findClearBoxes() {
+  document.querySelectorAll('.findLayer').forEach((l) => l.remove());
+  document.querySelectorAll('.textLayer span.find-hit').forEach((sp) => sp.classList.remove('find-hit', 'cur'));
+}
+
+/** 一页 DOM 的「拼接串 + 归一化映射 + 偏移→(文本节点, offset) 定位器」 */
+function findPageHay(pageDiv) {
+  const tl = pageDiv.querySelector('.textLayer');
+  if (!tl) return null;
+  // 用**文本节点**而不是 span：Range.setStart(node, n) 里的 n 对元素节点是「子节点序号」，
+  // 对文本节点才是字符偏移。之前把字符偏移直接喂给 span，Range 要么抛错、要么落在行首，
+  // getClientRects 拿不到有效矩形 → 这就是「搜到了却没有标黄」的根因。
+  const nodes = [];
+  const startOf = [];
+  let hay = '';
+  const walker = document.createTreeWalker(tl, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const t = n.nodeValue || '';
+    if (!t) continue;
+    nodes.push(n);
+    startOf.push(hay.length);
+    hay += t;
+  }
+  if (!hay) return null;
+  const { nh, map } = findNorm(hay);
+  if (!nh) return null;
+  const at = (off) => {
+    let lo = 0;
+    let hi = startOf.length - 1;
+    let idx = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (startOf[mid] <= off) { idx = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return [nodes[idx], Math.min(off - startOf[idx], nodes[idx].nodeValue.length)];
+  };
+  return { nh, map, at };
+}
+
+/** 兜底高亮：Range 几何算不出来（跨节点怪例、TextLayer 结构变化）时给 span 加类。
+ *  宁可粗一点，也不能出现「搜到了却看不见」。 */
+function findMarkSpansFallback(tl, ord) {
+  const spans = [...tl.querySelectorAll('span:not(.markedContent)')];
+  let seen = 0;
+  for (const sp of spans) {
+    const t = sp.textContent || '';
+    const { nh } = findNorm(t);
+    if (!nh || !nh.includes(find.needle)) continue;
+    sp.classList.add('find-hit');
+    if (seen === ord) sp.classList.add('cur');
+    seen += 1;
+  }
+  return seen > 0;
+}
+
+/** 在指定页画出该页全部命中（第 ord 处标为当前），返回当前盒子供滚动 */
+function findMarkPage(page, ord) {
+  findClearBoxes();
+  const div = origPageNode(page);
+  const tl = div && div.querySelector('.textLayer');
+  if (!div || !tl || !find.needle) return null;
+  const hay = findPageHay(div);
+  if (!hay) return null;
+  const rect = tl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const layer = document.createElement('div');
+  layer.className = 'findLayer';
+  // 必须插在 textLayer **之前**：paintPage 靠 div.firstChild/lastChild 取 canvas/textLayer，
+  // 追加在后面会让 lastChild 变成高亮层 → TextLayer 挂错容器（同 paintEqLayer 的坑）
+  div.insertBefore(layer, tl);
+  const percent = (v, base) => (v / base * 100).toFixed(3) + '%';
+  let cur = null;
+  let found = 0;
+  let from = 0;
+  for (;;) {
+    const at = hay.nh.indexOf(find.needle, from);
+    if (at < 0) break;
+    const start = hay.map[at];
+    const end = hay.map[at + find.needle.length - 1] + 1;
+    const [nodeA, offA] = hay.at(start);
+    const [nodeB, offB] = hay.at(end);
+    try {
+      const rng = document.createRange();
+      rng.setStart(nodeA, offA);
+      rng.setEnd(nodeB, offB);
+      for (const r of rng.getClientRects()) {
+        if (r.width < 0.6 || r.height < 0.6) continue;   // 换行点产生的退化矩形跳过
+        const isCur = found === ord;
+        const box = document.createElement('span');
+        box.className = 'find-box' + (isCur ? ' cur' : '');
+        box.style.left = percent(r.left - rect.left, rect.width);
+        box.style.top = percent(r.top - rect.top, rect.height);
+        box.style.width = percent(r.width, rect.width);
+        box.style.height = percent(r.height, rect.height);
+        layer.appendChild(box);
+        if (isCur && !cur) cur = box;
+      }
+    } catch { /* 这一处几何算不出来：循环结束后统一兜底 */ }
+    found += 1;
+    from = at + Math.max(1, find.needle.length);
+    if (found > 600) break;   // 单页防御
+  }
+  if (!layer.childElementCount) {
+    layer.remove();                     // 空层留着也没用
+    findMarkSpansFallback(tl, ord);     // 兜底：给命中的 span 上底色
+    return null;
+  }
+  return cur;
+}
+
+/** 等目标页真的出现（翻页/分屏模式要先切页再等 TextLayer 铺好） */
+async function findReadyPage(page) {
+  if (!pdfDoc) return;
+  const p = Math.max(1, Math.min(page, pdfDoc.numPages));
+  if ((pageMode === 'paged' || viewMode === 'split') && curPage !== p) {
+    curPage = p;
+    await rerender();
+    updatePager();
+  }
+  for (let i = 0; i < 120; i++) {
+    const div = origPageNode(p);
+    if (div && div.querySelector('.textLayer span')) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+async function findGoto(i) {
+  if (!find.hits.length) return;
+  const n = find.hits.length;
+  find.idx = ((i % n) + n) % n;          // 首尾循环
+  const hit = find.hits[find.idx];
+  await findReadyPage(hit.page);
+  if (!find.hits.length) return;
+  const cur = findMarkPage(hit.page, hit.ord);
+  updateFindCount();
+  if (!find.listStale) syncFindCurrent();
+  const target = cur || origPageNode(hit.page);
+  if (target) {
+    await new Promise((r) => requestAnimationFrame(r));
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+/** 新的查询：清空命中 → 建索引（有缓存则秒回）→ 收集 → 渲染列表 */
+async function findRun(q) {
+  find.q = q;
+  find.needle = findNorm(q).nh;
+  find.hits = [];
+  find.idx = -1;
+  find.listStale = true;
+  findClearBoxes();
+  renderFindList();
+  if (!find.needle) { updateFindCount(); return; }
+  updateFindCount('索引…');
+  await findBuildIndex();
+  if (find.q !== q) return;              // 期间输入又变了
+  findCollect();
+  renderFindList();
+  updateFindCount();
+  // 输入框就在窗口里，所以窗口一打开就一直开着；有结果时顺手把列表滚到当前命中
+  findWinShow(true);
+}
+
+/** 打开查找窗口（focus=true 时选中输入框内容，方便直接改写关键词） */
+function findPanelOpen(focus) {
+  if (!findWinEl) return;
+  findWinShow(true);
+  if (find.idx >= 0) findReapply();   // 重新打开时把上次的当前命中重新标出来，不用再跳一次
+  if (focus) { findInputEl.focus(); findInputEl.select(); }
+}
+
+/** 关闭查找窗口：连页内高亮一起收掉（关键词留着，下次按 🔍 还能直接用） */
+function findClose() {
+  findWinShow(false);
+  findClearBoxes();
+}
+
+/** 拖动窗口标题栏（指针事件：鼠标/触控板/触屏同一套） */
+function findWinDrag(e) {
+  if (e.button !== 0 || e.target.closest('button')) return;  // 头部按钮不触发拖动
+  e.preventDefault();
+  const start = { mx: e.clientX, my: e.clientY, x: findWinEl.offsetLeft, y: findWinEl.offsetTop };
+  const move = (ev) => {
+    findWin.x = start.x + (ev.clientX - start.mx);
+    findWin.y = start.y + (ev.clientY - start.my);
+    findWinPlace();
+  };
+  const up = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    window.removeEventListener('pointercancel', up);
+    findWinSave();
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+}
+
+/** 拖边缘/右下角改大小：dir = 'se'（角）| 'e'（右边缘）| 's'（下边缘） */
+function findWinResize(e, dir) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const start = { mx: e.clientX, my: e.clientY, w: findWinEl.offsetWidth, h: findWinEl.offsetHeight, x: findWinEl.offsetLeft, y: findWinEl.offsetTop };
+  const move = (ev) => {
+    if (dir !== 's') findWin.w = Math.max(220, Math.min(window.innerWidth - 16, start.w + (ev.clientX - start.mx)));
+    if (dir !== 'e') findWin.h = Math.max(150, Math.min(window.innerHeight - 24, start.h + (ev.clientY - start.my)));
+    findWin.x = start.x;
+    findWin.y = start.y;
+    findWinPlace();
+  };
+  const up = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    window.removeEventListener('pointercancel', up);
+    findWinSave();
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+}
+
+/** 缩放/换模式/开关分屏后 DOM 被重建：把当前命中重新画上去 */
+function findReapply() {
+  if (!find.shown || !find.hits.length) return;
+  const hit = find.hits[find.idx];
+  if (hit) findMarkPage(hit.page, hit.ord);
+}
+
+/** 换了文档（换论文/原文↔译文）：索引与命中全部作废，输入框里的词留着 */
+function findReset() {
+  find.index = null;
+  find.doc = null;
+  find.hits = [];
+  find.idx = -1;
+  find.needle = '';
+  find.q = '';
+  find.listStale = true;
+  findClearBoxes();
+  updateFindCount();
+  renderFindList();
+}
+
+findInputEl.addEventListener('input', () => {
+  clearTimeout(findTimer);
+  const q = findInputEl.value.trim();
+  // 边打边算（220ms 防抖）但不自动跳页：跳页留给 Enter/上下箭头，避免打字时页面乱跳
+  findTimer = setTimeout(() => { void findRun(q); }, 220);
+});
+findInputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    clearTimeout(findTimer);
+    const q = findInputEl.value.trim();
+    if (q !== find.q) { void findRun(q).then(() => findGoto(0)); return; }
+    void findGoto(find.idx + (e.shiftKey ? -1 : 1));
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    findClose();
+  }
+});
+// 🔍 只是「打开查找窗口」：窗口关着就开、开着就把焦点给输入框（关键词和结果都还在）
+$('find-open').onclick = () => {
+  if (!pdfDoc) return;
+  findPanelOpen(true);
+};
+$('find-prev').onclick = () => { void findGoto(find.idx - 1); };
+$('find-next').onclick = () => { void findGoto(find.idx + 1); };
+$('find-window-close').onclick = findClose;
+$('find-expand').onclick = () => findSetExpand(!find.expand);
+$('find-head').addEventListener('pointerdown', findWinDrag);
+$('find-grip').addEventListener('pointerdown', (e) => findWinResize(e, 'se'));
+$('find-grip-r').addEventListener('pointerdown', (e) => findWinResize(e, 'e'));
+$('find-grip-b').addEventListener('pointerdown', (e) => findWinResize(e, 's'));
+document.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'f' || e.key === 'F') && pdfDoc) {
+    e.preventDefault();
+    findPanelOpen(true);
+  }
+});
+window.addEventListener('resize', () => {
+  if (findWinEl.classList.contains('on')) findWinPlace();   // 视口变小：把窗口夹回可见范围
+});
+findWinLoad();
+
+/** 排查用：控制台执行 dprFindDebug() 能看到当前查找的内部状态（高亮不显示时先看 boxes 是否为 0） */
+window.dprFindDebug = () => {
+  const cur = find.hits[find.idx];
+  return {
+    q: find.q,
+    needle: find.needle,
+    hits: find.hits.length,
+    idx: find.idx,
+    indexPages: find.index ? find.index.size : 0,
+    currentHit: cur ? { page: cur.page, ord: cur.ord } : null,
+    spansInDom: document.querySelectorAll('.textLayer span').length,
+    boxes: document.querySelectorAll('.find-box').length,
+    fallbackMarks: document.querySelectorAll('.textLayer span.find-hit').length,
+    windowOpen: !!(findWinEl && findWinEl.classList.contains('on')),
+    winPos: findWinEl ? { x: findWinEl.offsetLeft, y: findWinEl.offsetTop, w: findWinEl.offsetWidth, h: findWinEl.offsetHeight } : null,
+  };
+};
+
+/* ================= 中英切换 ================= */
+/** 翻译进度条（只在 busy 时出现）：宽度跟着后端 progress.overall，文字给阶段+百分比。 */
+function updateZhProgress() {  const box = $('zh-prog');
+  const p = zhState && zhState.busy ? zhState.progress : null;
+  if (!p) { box.hidden = true; return; }
+  const pct = typeof p.overall === 'number' ? Math.max(0, Math.min(100, p.overall)) : null;
+  box.hidden = false;
+  box.querySelector('.fill').style.width = (pct === null ? 8 : Math.max(2, pct)).toFixed(1) + '%';
+  box.querySelector('.txt').textContent = pct === null
+    ? `${p.label || '翻译'}…`
+    : `${p.label || '翻译'} ${Math.round(pct)}%`;
+  box.title = p.text || '';
+}
+// 别人启动的翻译（另开会话/刷新页面后进来）也要能看到进度：busy 就自动挂一个低成本轮询
+let zhWatch = null;
+let zhGenerating = false;
+function ensureZhWatch() {
+  if (zhState.busy && !zhWatch && !zhGenerating) {
+    zhWatch = setInterval(() => { void refreshZhState(); }, 1200);
+  } else if (!zhState.busy && zhWatch) {
+    clearInterval(zhWatch); zhWatch = null;
+  }
+}
+async function refreshZhState() {
+  zhState = await api('/zh?' + readerQuery());
+  const btn = $('zh-toggle');
+  btn.style.display = '';
+  btn.disabled = zhState.busy;
+  btn.innerHTML = iconHtml(zhState.busy ? 'spin' : 'translate'); // busy：旋转弧图标（原「译」字）
+  btn.title = zhState.busy ? (zhState.phase || `翻译进行中${zhState.model ? `（${zhState.model}）` : ''}…`)
+    : (zhState.zh || zhState.dual) ? '切换中文译文'
+    : '还没有中文版，点击生成（babeldoc，需要几分钟）';
+  // 安装/准备阶段在状态栏持续可见（轮询每 5s 刷新一次）；翻译结束后恢复论文基线信息
+  const statusEl = $('status');
+  if (zhState.busy && zhState.phase) {
+    statusEl.textContent = zhState.phase;
+    statusEl.dataset.phaseShown = '1';
+  } else if (!zhState.busy && statusEl.dataset.phaseShown) {
+    delete statusEl.dataset.phaseShown;
+    if (statusMeta) statusEl.textContent = statusMeta;
+  }
+  updateZhProgress();
+  ensureZhWatch();
+  // 重翻按钮只在「已有译文且空闲」时出现；状态变化时顺手拆掉两击确认的待确认态
+  const regen = $('zh-regen');
+  const canRegen = (zhState.zh || zhState.dual) && !zhState.busy;
+  regen.style.display = canRegen ? '' : 'none';
+  if (!canRegen) disarmRegen();
+  // 分屏激活中 -zh.pdf 没了（重翻/外部删除）→ 自动回落原文 + toast + 把持久化写回 ''（§4.2/B8）
+  if (viewMode === 'split' && !zhState.zh) {
+    toast('中文版不存在，已退回原文', 4000);
+    await setViewMode('orig');
+    return;
+  }
+  updateViewButtons();
+}
+
+/** 顶栏三个视图控件的状态机（§4.3）：文案/active/disabled/title 全在这一处决定。 */
+function updateViewButtons() {
+  const zt = $('zh-toggle'), dt = $('dual-toggle'), st = $('split-toggle');
+  const hasZh = zhState.zh, hasDual = zhState.dual, hasAny = hasZh || hasDual;
+  const splitOn = viewMode === 'split';
+  // 「中」的语义**不变**：原文 ↔ (有 zh ? 'zh' : 'dual')；分屏时加闸（避免在 zhVariant===null
+  // 的误解下误开生成流程），其余情况与改造前逐字一致。
+  zt.disabled = splitOn || zhState.busy;
+  zt.title = splitOn ? '分屏对照中：先关闭分屏'
+    : zhState.busy ? (zhState.phase || `翻译进行中${zhState.model ? `（${zhState.model}）` : ''}…`)
+    : hasAny ? '切换中文译文'
+    : '还没有中文版，点击生成（babeldoc，需要几分钟）';
+  zt.classList.toggle('active', zhVariant !== null);
+
+  dt.style.display = '';   // D1（队长裁定）：按钮恒可见，无产物时 disabled + title 说明原因，
+                           // 把死控件变成解释（与 §6 B1 字面一致，也与 zhonly/dualonly 两态一致）
+  dt.classList.toggle('active', viewMode === 'dual');
+  dt.disabled = zhState.busy || !hasDual;
+  dt.title = zhState.busy ? (zhState.phase || '翻译进行中…')
+    : !hasDual ? '还没有中英对照版，先用「中」生成（babeldoc，需要几分钟）'
+    : viewMode === 'dual' ? '当前：中英对照（模式 A），点击回到原文'
+    : '用 babeldoc 的中英对照 PDF（模式 A）';
+
+  st.style.display = '';   // D1：同上
+  st.classList.toggle('active', splitOn);
+  st.disabled = zhState.busy || !hasZh;
+  st.title = zhState.busy ? (zhState.phase || '翻译进行中…')
+    : !hasZh ? (hasDual ? '需先生成中文版（模式 B 用 -zh.pdf 与原文并排）' : '还没有中文版，先用「中」生成（babeldoc，需要几分钟）')
+    : splitOn ? '当前：分屏对照（模式 B），点击回到原文'
+    : '原文与中文版并排同步滚动（模式 B）';
+
+  // 「同步滚动」开关：与三个视图控件同一个状态机（一处决定所有按钮的可见性/文案/态）；
+  // 仅分屏下可见 —— 模式 A/原文/译文只有一个滚动条，开关无意义
+  updateSyncToggle();
+}
+
+$('zh-toggle').onclick = async () => {
+  if (!current || zhState.busy || viewMode === 'split') return;
+  if (zhState.dual || zhState.zh) {
+    // 两态切换：原文 ↔ 纯中文；只存在对照版时退到对照（既有语义一字不动）
+    await setViewMode(zhVariant === null ? (zhState.zh ? 'zh' : 'dual') : 'orig');
+    return;
+  }
+  await startGenerate(false);
+};
+
+/* ================= 视图模式（模式 A 对照 / 模式 B 分屏）=================
+   三个控件共用 viewMode；进入任一非 orig 模式都先退出另一个（互斥）。 */
+
+/** 持久化复用既有键：lib/client.js 的改名搬家只搬 `dpr.variant.` 前缀，新增键不会被迁移（C19）。 */
+function persistViewMode() {
+  localStorage.setItem(variantKey(current.topic, current.name, current.paperId), viewMode === 'orig' ? '' : viewMode);
+}
+
+/** 读回持久化的视图模式（§4.3 的取值表）：译文/分屏不存在时回落原文，非空不可用的值由调用方回写空。 */
+function viewModeFromSaved(saved, st) {
+  if (saved === 'zh' && st.zh) return 'zh';
+  if (saved === 'dual' && st.dual) return 'dual';
+  if (saved === 'split' && st.zh) return 'split';   // 分屏需要 -zh.pdf
+  return 'orig';
+}
+
+/** 视图模式的状态机（守卫 → 赋值 → 持久化 → 三个按钮/下载按钮/公式面板）。
+ *  返回 false = 守卫拦下（状态未变）。渲染留给 setViewMode，便于单测状态机（B11/B12/R4）。 */
+function applyViewMode(mode) {
+  if (!current) return false;
+  if (mode === 'dual' && !zhState.dual) return false;   // 没有 -dual.pdf，不进（按钮已 disabled）
+  if (mode === 'split' && !zhState.zh) return false;    // 没有 -zh.pdf，不进
+  if (mode === 'split' && window.innerWidth < SPLIT_MIN_WIDTH) {
+    toast('面板太窄，请把阅读器拉宽后再用分屏对照', 4000);
+    return false;
+  }
+  viewMode = mode;
+  zhVariant = mode === 'zh' ? 'zh' : mode === 'dual' ? 'dual' : null; // split → null（C17）
+  persistViewMode();
+  // 切换变体后强制适宽：译文版页宽与原文不同（对照双栏≈2×、分屏每列半宽），不重算会溢出裁切
+  fitMode = true; fitBtn.classList.add('active');
+  updateViewButtons();
+  updateDlBtn();
+  renderEqPanel(); // 译文视图要给出「没有位置信息」的说明（热区同时被 eqHotEnabled 关掉）
+  return true;
+}
+
+async function setViewMode(mode) {
+  await window.DprInk?.beforeNavigate?.();
+  try {
+    if (!applyViewMode(mode)) return;
+    if (mode === 'split') { await openSplit(); return; }
+    teardownSplit();
+    await loadPdf(pdfUrl(zhVariant));
+  } finally { window.DprInk?.didNavigate?.(); }
+}
+$('dual-toggle').onclick = () => setViewMode(viewMode === 'dual' ? 'orig' : 'dual');
+$('split-toggle').onclick = () => setViewMode(viewMode === 'split' ? 'orig' : 'split');
+
+// 生成/重翻共用：force=true 时服务端先删旧译文再启动；成功后轮询到完成
+async function startGenerate(force) {
+  try {
+    const r = await api('/zh/generate', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(force ? { ...readerReference(), force: true } : readerReference()),
+    });
+    const m = zhState.model ? `（${zhState.model}）` : '';
+    toast(r.firstRun
+      ? '首次使用：正在自动安装翻译引擎（uv + Python + babeldoc，约几分钟），装完自动开始翻译…'
+      : (force ? `已删除旧译文，开始重新翻译${m}…` : `开始生成中文版${m}（约几分钟）…`), 6000);
+  } catch (e) {
+    // 没配端点 → 直接弹配置表单；填好保存后自动回来重试（记住是不是重翻）
+    if (e.code === 'no-endpoint') { cfgRetryForce = force; openCfgPop(true); return; }
+    toast(e.message, 8000); return;
+  }
+  $('zh-toggle').disabled = true; $('zh-toggle').innerHTML = iconHtml('spin');
+  $('zh-regen').style.display = 'none';
+  // 先本地亮一个「准备中」的进度条，别等第一轮轮询才出现（首轮可能要几秒）
+  zhState = { ...zhState, busy: true, progress: null };
+  updateZhProgress();
+  zhGenerating = true;
+  // 翻译期间 1s 一轮（进度条要跟手）；结束后自动停
+  const timer = setInterval(async () => {
+    await refreshZhState();
+    if (!zhState.busy) {
+      clearInterval(timer);
+      zhGenerating = false;
+      ensureZhWatch();
+      if (zhState.dual || zhState.zh) {
+        toast('中文版已生成');
+        // 重翻完成时用户可能正停在译文视图/分屏：原地刷新，而不是来回切换
+        if (viewMode === 'split') await renderSplit();
+        else if (zhVariant) await loadPdf(pdfUrl(zhVariant));
+        else $('zh-toggle').click();
+      }
+      else toast('生成失败：' + (zhState.error || '未知原因'), 8000);
+    }
+  }, 1000);
+}
+
+/* ================= 重新翻译（重翻按钮，两击确认） ================= */
+// 不用原生 confirm：阅读器跑在 dsh 桌面壳的 iframe 里，原生对话框行为不可靠。
+// 第一击把按钮变成「重翻?」待确认态（3 秒有效），第二击才真删真跑。
+let regenArmTimer = null;
+function disarmRegen() {
+  clearTimeout(regenArmTimer); regenArmTimer = null;
+  const btn = $('zh-regen');
+  btn.innerHTML = iconHtml('regen'); btn.classList.remove('active');
+}
+$('zh-regen').onclick = async () => {
+  if (!current || zhState.busy) return;
+  const btn = $('zh-regen');
+  if (regenArmTimer) {           // 第二击：确认执行
+    disarmRegen();
+    await startGenerate(true);
+    return;
+  }
+  btn.textContent = '重翻?';      // 第一击：进入待确认态
+  btn.classList.add('active');
+  regenArmTimer = setTimeout(disarmRegen, 3000);
+};
+
+/* ================= 翻译端点设置 ================= */
+// 供应商预设（OpenAI 兼容端点，对齐 lflow 的供应商清单）：选中即回填 URL + 推荐模型。
+// 一律走 Coding 套餐端点——买套餐是常态；套餐 key 走按量口会报余额不足。按量用户选「自定义」手填。
+// models 仅作 datalist 建议，输入框仍可自由填写（新型号上线不用发版）。
+// glm-5.x / k3 / deepseek-flash 是推理型，服务端会对这三家域名自动关 thinking（translate.ts）。
+const PROVIDERS = [
+  { id: 'custom',   name: '自定义（OpenAI 兼容）', baseUrl: '', models: [] },
+  { id: 'deepseek', name: 'DeepSeek',  baseUrl: 'https://api.deepseek.com',                     models: ['deepseek-v4-pro', 'deepseek-flash'] },
+  { id: 'glm',      name: '智谱 GLM',   baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4', models: ['glm-5.3-flash', 'glm-5.3', 'glm-4.6'] },
+  { id: 'kimi',     name: 'Kimi',      baseUrl: 'https://api.kimi.com/coding/v1',              models: ['k3'] },
+];
+const normUrl = (u) => (u || '').trim().replace(/\/+$/, '');
+// 按 baseUrl 反查预设（打开表单时回显选中项）；查不到就是 custom
+const providerOf = (baseUrl) => PROVIDERS.find((p) => p.id !== 'custom' && normUrl(p.baseUrl) === normUrl(baseUrl)) || PROVIDERS[0];
+
+(function initProviderSelect() {
+  const sel = $('cfg-provider');
+  for (const p of PROVIDERS) {
+    const opt = document.createElement('option');
+    opt.value = p.id; opt.textContent = p.name;
+    sel.appendChild(opt);
+  }
+  sel.onchange = () => {
+    const p = PROVIDERS.find((x) => x.id === sel.value) || PROVIDERS[0];
+    if (p.baseUrl) $('cfg-url').value = p.baseUrl;   // custom 不动用户已填的 URL
+    $('cfg-model-list').innerHTML = p.models.map((m) => `<option value="${esc(m)}">`).join('');
+    if (p.models.length && !p.models.includes($('cfg-model').value.trim())) $('cfg-model').value = p.models[0];
+  };
+})();
+
+// 保存成功后是否自动接着生成：点「中译」/「重翻」发现没配 → 弹本表单 → 填完直接开跑
+let cfgRetryGenerate = false;
+let cfgRetryForce = false;   // 待重试的是不是「重翻」（regen 图标进来时旧译文还在，zh-toggle 点击语义不对，必须带 force）
+let cfgRetryTranslate = false; // 待重试的是不是「划词翻译」（点「译」发现没配端点 → 填完自动重试这次翻译）
+
+async function openCfgPop(retryGenerate) {
+  cfgRetryGenerate = Boolean(retryGenerate);
+  let cfg;
+  try {
+    cfg = await api('/translate/config');
+  } catch (e) { toast('读取配置失败：' + e.message, 8000); return; }
+  $('cfg-url').value = cfg.baseUrl || '';
+  $('cfg-model').value = cfg.model || '';
+  // 按已存 URL 回显供应商，并触发一次 onchange 补齐模型候选（但不覆盖已存模型/URL）
+  const sel = $('cfg-provider');
+  sel.value = providerOf(cfg.baseUrl).id;
+  const keepUrl = $('cfg-url').value, keepModel = $('cfg-model').value;
+  sel.onchange();
+  $('cfg-url').value = keepUrl || $('cfg-url').value;
+  $('cfg-model').value = keepModel || $('cfg-model').value;
+  // 明文 key 不回传：留空 = 沿用已存的那把
+  $('cfg-key').value = '';
+  $('cfg-key').placeholder = cfg.hasApiKey ? `已保存（${cfg.apiKeyHint}），留空则不修改` : 'sk-...';
+  // 生效配置的来源：界面保存的文件 优先于 profile 的 YAML 默认值——两条来源都有时不说明会分不清生效的是谁
+  $('cfg-source').textContent =
+    cfg.source === 'file' ? `当前生效：本界面保存的配置（key ${cfg.apiKeyHint}）`
+    : cfg.source === 'profile' ? '当前生效：profile 默认配置（在本界面保存后会被覆盖）'
+    : '';
+  const pop = $('cfg-pop');
+  pop.style.display = 'block';
+  // 先显示再量尺寸（不像 #ask-pop 那样写死尺寸常量，免得跟 CSS 漂移）
+  pop.style.left = Math.max(8, (window.innerWidth - pop.offsetWidth) / 2) + 'px';
+  pop.style.top = Math.max(8, (window.innerHeight - pop.offsetHeight) / 3) + 'px';
+  $('cfg-key').focus();
+}
+function closeCfgPop() { $('cfg-pop').style.display = 'none'; cfgRetryGenerate = false; cfgRetryForce = false; cfgRetryTranslate = false; }
+
+$('cfg-open').onclick = () => openCfgPop(false);
+$('cfg-cancel').onclick = closeCfgPop;
+
+$('cfg-save').onclick = async () => {
+  // retry/force/translate 先捞出来：closeCfgPop 会把这三个待确认态清零
+  const btn = $('cfg-save'), label = btn.textContent, retry = cfgRetryGenerate, force = cfgRetryForce, retryTr = cfgRetryTranslate;
+  btn.disabled = true; btn.textContent = '测试中…';
+  try {
+    // 服务端先打一发极小的 chat/completions 验证 url/key/model，通过才落盘
+    await api('/translate/config', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        baseUrl: $('cfg-url').value.trim(),
+        apiKey: $('cfg-key').value.trim(),
+        model: $('cfg-model').value.trim(),
+      }),
+    });
+  } catch (e) {
+    toast('保存失败：' + e.message, 8000);
+    return;
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+  closeCfgPop();
+  await refreshZhState();
+  if (retry) startGenerate(force);  // 沿用触发来源的语义：zh-toggle=生成，regen=重翻
+  else if (retryTr) translateSelection(); // 划词翻译发现没配端点 → 填完自动重试这一次翻译（§3.7①）
+  else toast('翻译端点已保存');
+};
+
+/* ================= PDF 渲染(pdf.js:缩放 + devicePixelRatio 高清,移植自 pdfqa) ================= */
+/* pdf.js 6.x 本地 vendor：动态 import（缓存的 Promise），loadPdf 先 await 再用——
+   底部经典脚本解析期就开跑 bootstrap()，必须由这里保证「pdf.js 就绪后才渲染」；
+   失败（vendor 404 / MIME 拒绝）抛带 URL 的可读错误，而不是莫名其妙的 ReferenceError。 */
+let pdfjsReadyP = null;
+function ensurePdfjs() {
+  if (!pdfjsReadyP) {
+    pdfjsReadyP = import('/paper-reader/vendor/pdf.min.mjs').then(
+      (m) => {
+        window.pdfjsLib = m;
+        m.GlobalWorkerOptions.workerSrc = '/paper-reader/vendor/pdf.worker.min.mjs';
+        return m;
+      },
+      (e) => {
+        pdfjsReadyP = null; // 失败后清缓存：瞬时故障不至于让本页签永久坏掉，下次 loadPdf 重试
+        throw new Error('pdf.js 加载失败（/paper-reader/vendor/pdf.min.mjs）：' + (e && e.message ? e.message : e));
+      },
+    );
+  }
+  return pdfjsReadyP;
+}
+ensurePdfjs().catch(() => {}); // 预热：与 bootstrap 的 API 请求并行拉取，不把首屏串行化
+
+let pdfDoc = null;
+let zoomScale = 1.5;
+let dpr = window.devicePixelRatio || 1;
+let renderToken = 0;
+
+(function watchDpr() {
+  const mq = matchMedia(`(resolution: ${dpr}dppx)`);
+  mq.addEventListener('change', function onChange() {
+    mq.removeEventListener('change', onChange);
+    dpr = window.devicePixelRatio || 1;
+    if (pdfDoc) rerender();
+    watchDpr();
+  });
+})();
+
+async function loadPdf(url, opts = {}) {
+  await ensurePdfjs(); // 就绪前禁止触 pdfjsLib（defer 竞态，见文件头注释）
+  const requestedDoc=pdfDoc;
+  const nextDoc=await pdfjsLib.getDocument({ url }).promise;
+  pdfDoc=nextDoc;
+  if(requestedDoc&&requestedDoc!==nextDoc)void requestedDoc.destroy?.(); // release the previous PDF worker/cache on paper switches
+  // 换了文档（换论文 / 原文↔译文）：查找索引按文档对象缓存，这里必须作废，
+  // 否则会拿旧文档的页码去定位新文档（页数不同时直接跳错页）。
+  if (find.doc !== pdfDoc) findReset();
+  $('empty').style.display = 'none';
+  // 翻页控件与模式切换按钮：文档就绪后才出现
+  $('pager').style.display = '';
+  $('mode-toggle').style.display = '';
+  // 分屏（模式 B）自己安排两列的渲染与适宽：这里只把原文文档装上，不触发单列渲染
+  if (opts.deferRender) return;
+  if (fitMode) { await fitToWidth(); return; } // Restore only after first visible raster is ready.
+  await rerender();
+}
+
+/** 构建单页 DOM 骨架（.page + canvas + textLayer），位图与文本由 paintPage 异步填充。
+ *  `doc` = 'orig' | 'zh'：**无条件**写在每个页节点上（分屏时两个文档的页号相同，热区几何
+ *  与选区归属都靠它判别；只有分屏才写的话普通模式的选择器会取到 null）。 */
+function makePageNode(i, viewport, doc = 'orig', placeholder = false) {
+  const div = document.createElement('div');
+  div.className = 'page';
+  div.dataset.page = i;
+  div.dataset.doc = doc;
+  div._dprViewport = viewport;
+  div._dprDocument = doc === 'zh' ? pdfDocZh : pdfDoc;
+  div.style.width = viewport.width + 'px';
+
+  const canvas = document.createElement('canvas');
+  canvas.width = placeholder ? 1 : Math.ceil(viewport.width * dpr);
+  canvas.height = placeholder ? 1 : Math.ceil(viewport.height * dpr);
+  canvas.style.width = viewport.width + 'px';
+  canvas.style.height = viewport.height + 'px';
+  div.appendChild(canvas);
+
+  const tl = document.createElement('div');
+  tl.className = 'textLayer';
+  tl.style.width = viewport.width + 'px';
+  tl.style.height = viewport.height + 'px';
+  tl.style.setProperty('--scale-factor', String(viewport.scale));
+  div.appendChild(tl);
+  return div;
+}
+
+/** PDF paint order is not reading order: interleaved column spans make native Range
+ * include unrelated paragraphs. Reorder only plain horizontal text-layer nodes;
+ * never change glyph geometry, marked-content structure, or rotated text. */
+function normalizeTextReadingOrder(tl, viewport) {
+  const nodes = [...tl.children];
+  if (nodes.some(n => !['SPAN', 'BR'].includes(n.tagName) || n.classList.contains('markedContent'))) return;
+  const groups = [];
+  for (const node of nodes) {
+    if (node.tagName === 'BR') { groups.at(-1)?.nodes.push(node); continue; }
+    if (node.style.getPropertyValue('--rotate') && parseFloat(node.style.getPropertyValue('--rotate')) !== 0) return;
+    const r = node.getBoundingClientRect();
+    groups.push({ nodes: [node], x: r.left, y: r.top, right: r.right, bottom: r.bottom, height: r.height });
+  }
+  if (groups.length < 2) return;
+  const heights = groups.map(g => g.height).filter(h => h > 0).sort((a,b) => a-b);
+  const lineHeight = heights[Math.floor(heights.length / 2)] || 12 * viewport.scale;
+  function gap(items, axis, threshold) {
+    const end = axis === 'x' ? 'right' : 'bottom';
+    const sorted = [...items].sort((a,b) => a[axis]-b[axis]);
+    let edge = sorted[0][end], cut = null, best = threshold;
+    for (let i=1; i<sorted.length; i++) {
+      const distance = sorted[i][axis]-edge;
+      if (distance > best) { best = distance; cut = i; }
+      edge = Math.max(edge, sorted[i][end]);
+    }
+    return cut === null ? null : [sorted.slice(0,cut), sorted.slice(cut)];
+  }
+  function order(items, depth=0) {
+    if (items.length < 2 || depth > 16) return items;
+    // Whitespace cuts isolate headings/paragraphs before traversing each column.
+    const vertical = gap(items, 'x', Math.max(12 * viewport.scale, viewport.width * .025));
+    const horizontal = gap(items, 'y', lineHeight * .8);
+    const split = vertical || horizontal;
+    if (split) return [...order(split[0],depth+1), ...order(split[1],depth+1)];
+    return [...items].sort((a,b) => Math.abs(a.y-b.y) < lineHeight*.4 ? a.x-b.x : a.y-b.y);
+  }
+  for (const group of order(groups)) for (const node of group.nodes) tl.appendChild(node);
+}
+
+/** 渲染单页内容（canvas 位图 + pdf.js 6.x TextLayer 文本层）。token 失效（被更新的渲染
+    抢占）时中途放弃——旧 renderAllPages 循环体里的守卫原样搬进来。 */
+async function paintPage(page, div, viewport, token, publish = true) {
+  const canvas = div.firstChild;
+  const tl = div.querySelector('.textLayer');
+  canvas.width=Math.ceil(viewport.width*dpr);canvas.height=Math.ceil(viewport.height*dpr);
+  tl.replaceChildren();
+  await page.render({
+    canvasContext: canvas.getContext('2d'),
+    viewport,
+    transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null,
+  }).promise;
+  if (token !== renderToken) return;
+  const tc = await page.getTextContent();
+  if (token !== renderToken) return;
+  // pdf.js 6.x: renderTextLayer() 移除，改 TextLayer 类
+  await new pdfjsLib.TextLayer({ textContentSource: tc, container: tl, viewport }).render();
+  // 公式热区层（pointer-events:none，只画描边；命中在 JS 里按坐标算）。
+  // 唯一铺层点放在这里（不是各自的渲染循环里）：滚动与翻页两条路径共用它——
+  // renderPaged 完全绕过 renderAllPages 的循环，写在那边翻页模式热区会全哑。
+  // 也不放进 makePageNode：它靠 div.firstChild/lastChild 取 canvas/textLayer，
+  // 提前 append 热区层会让 lastChild 变成热区层 → TextLayer 挂错容器、文本层错位。
+  // token 守卫（t4 评审 O5）：TextLayer.render() 也是 await，期间可能已被更新的渲染抢占；
+  // 少了这一行，被抢占的收尾会把**上一档缩放**的几何写回 EQ_BY_PAGE → 点击热区整体偏移。
+  if (token !== renderToken || !publish) return;
+  normalizeTextReadingOrder(tl, viewport);
+  paintEqLayer(div, viewport, +div.dataset.page);
+  div._dprPainted = true;
+  document.dispatchEvent(new CustomEvent('dpr-page-painted', { detail: { page: div } }));
+}
+
+/** 当前模式的全量重渲入口：缩放/DPR/换文档/换变体统一走这里。
+ *  分屏（模式 B）是第三套布局，转到 renderSplit()；renderPaged/renderAllPages 的既有语义**不变**。 */
+function rerender() {
+  // 渲染完成后再补画查找高亮：缩放/切模式把 DOM 整个重建，旧的高亮层随之消失。
+  const done = () => { try { findReapply(); } catch { /* 高亮是装饰，失败不影响阅读 */ } };
+  if (viewMode === 'split') return renderSplit().then(done);
+  return (pageMode === 'paged' ? renderPaged() : renderAllPages()).then(done);
+}
+
+// 隐藏期间被跳过的重渲请求：尺寸恢复（resize）后补跑。
+// ⚠️ 曾经的坑（用户实测「点放大后全空白」）：守卫在 ++renderToken 之后——隐藏期间的
+// 渲染请求先作废在途渲染、自己又因高度 0 提前返回，容器已被清空却无人再画；且退出
+// 适宽模式后 resize 只重算适宽（if (fitMode)），不补渲 → 永久空白。改为：隐藏期间
+// 的请求直接跳过（不动 token、在途渲染照常画完），标记 pending 等恢复后补画。
+let pendingRerender = false;
+
+/* PDF VIEWPORT RENDERER */
+const lazyPdfObservers=new Map(),lazyPdfQueue=new Set();let lazyPdfWork=null;
+function lazyPdfVisible(node,pane,margin=350){const p=pane.getBoundingClientRect(),r=node.getBoundingClientRect();return pane.clientHeight>0&&p.width>0&&r.bottom>=p.top-margin&&r.top<=p.bottom+margin;}
+function lazyPdfCurrent(node){return node.isConnected&&node._dprDocument===(node.dataset.doc==='zh'?pdfDocZh:pdfDoc);}
+function queueLazyPdfPage(node){if(!node._dprPainted&&lazyPdfCurrent(node))lazyPdfQueue.add(node);}
+function drainLazyPdfPages(){
+  if(lazyPdfWork)return lazyPdfWork;
+  lazyPdfWork=(async()=>{while(lazyPdfQueue.size){
+    const node=lazyPdfQueue.values().next().value;lazyPdfQueue.delete(node);
+    const pane=node.closest('#pdf-pane,#pdf-pane-zh');if(!pane||!lazyPdfCurrent(node)||node._dprPainted||!lazyPdfVisible(node,pane))continue;
+    const doc=node._dprDocument,token=renderToken;
+    try{const page=await doc.getPage(+node.dataset.page);if(!lazyPdfCurrent(node))continue;if(doc!==node._dprDocument){queueLazyPdfPage(node);continue;}await paintPage(page,node,node._dprViewport,token);
+      if(!node._dprPainted&&lazyPdfCurrent(node))lazyPdfQueue.add(node);
+      if(node._dprPainted)try{findReapply();}catch{}
+    }catch(error){if(lazyPdfCurrent(node))toast('此页绘制暂未完成，滚动回到本页可重试',4000);}
+    await new Promise(resolve=>setTimeout(resolve,0));
+  }})().finally(()=>{lazyPdfWork=null;});return lazyPdfWork;
+}
+function observeLazyPdfPages(container,pane){
+  lazyPdfObservers.get(container)?.disconnect();
+  const observer=new IntersectionObserver(entries=>{for(const row of entries)if(row.isIntersecting)queueLazyPdfPage(row.target);void drainLazyPdfPages();},{root:pane,rootMargin:'350px 0px',threshold:0});
+  lazyPdfObservers.set(container,observer);
+  for(const node of container.children){observer.observe(node);if(lazyPdfVisible(node,pane))queueLazyPdfPage(node);}
+  return drainLazyPdfPages();
+}
+/* END PDF VIEWPORT RENDERER */
+async function renderAllPages() {
+  const pane = $('pdf-pane');
+  if (pane.clientHeight === 0) { pendingRerender = true; return; } // 悬浮层隐藏期间不重渲（否则锚点恢复会把滚动清零）
+  const token = ++renderToken;
+  const container = $('pdf-pages');
+  const scale = zoomScale; // 单次渲染内快照：隐藏期间的 setZoom 改全局值也不至于画出混合缩放
+  // 滚动比例锚点：不用 DOM rect（并发重渲时旧页可能已被清空，rect 全灭 → 锚点归零）
+  const range = pane.scrollHeight - pane.clientHeight;
+  const anchorRatio = range > 0 ? pane.scrollTop / range : 0;
+  container.innerHTML = '';
+  container.classList.remove('paged'); // 切回滚动：必须摘掉单页布局类（paged 由 renderPaged 加上）
+  clearEqGeometry();                   // 旧页几何 + 跨页残留的 hover/hit 描边随 DOM 一起作废
+  $('zoom-label').textContent = Math.round(scale / 1.5 * 100) + '%';
+
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    if (token !== renderToken) return;
+    const page = await pdfDoc.getPage(i);
+    if (token !== renderToken) return;
+    const viewport = page.getViewport({ scale });
+    const div = makePageNode(i, viewport, 'orig', true);
+    container.appendChild(div);
+    if(i%8===0)await new Promise(resolve=>setTimeout(resolve,0));
+  }
+  const newRange = pane.scrollHeight - pane.clientHeight;
+  pane.scrollTop = anchorRatio * Math.max(0, newRange);
+  restoreReadingPosition();
+  observePages();
+  await observeLazyPdfPages(container,pane);
+}
+
+/** 翻页模式：只渲染 curPage 一页（按需渲染，天然无长文档性能问题）。 */
+async function renderPaged() {
+  if ($('pdf-pane').clientHeight === 0) { pendingRerender = true; return; } // 同 renderAllPages：跳过并标记，恢复后补画
+  const token = ++renderToken;
+  const container = $('pdf-pages');
+  const scale = zoomScale; // 同 renderAllPages：快照，防混合缩放
+  curPage = Math.min(Math.max(1, curPage), pdfDoc.numPages);
+  container.innerHTML = '';
+  clearEqGeometry(); // 同上：翻页模式下换页/缩放时，旧页几何与 hover 残留必须一起作废（否则命中整体偏移）
+  container.classList.add('paged');
+  $('zoom-label').textContent = Math.round(scale / 1.5 * 100) + '%';
+  updatePager();
+  const page = await pdfDoc.getPage(curPage);
+  if (token !== renderToken) return;
+  const viewport = page.getViewport({ scale });
+  const div = makePageNode(curPage, viewport);
+  container.appendChild(div);
+  await paintPage(page, div, viewport, token);
+}
+
+/** 滚动模式当前页探测：视口竖直中线带（±45%）压到哪页，哪页就是当前页。
+    每次全量重渲后重建（页节点全换）。翻页控件与模式切换共享 curPage。 */
+let pageObserver = null;
+function observePages() {
+  pageObserver?.disconnect();
+  pageObserver = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      if (en.isIntersecting) {
+        curPage = +en.target.dataset.page || curPage;
+        updatePager();
+      }
+    }
+  }, { root: $('pdf-pane'), rootMargin: '-45% 0px -45% 0px', threshold: 0 });
+  document.querySelectorAll('#pdf-pages .page').forEach((d) => pageObserver.observe(d));
+}
+
+function setZoom(newScale, point) {
+  if (!pdfDoc) return;
+  zoomScale = Math.min(4.5, Math.max(0.6, newScale));
+  if (typeof stablePdfZoom === 'function' && stablePdfZoom(zoomScale, point)) return;
+  return rerender();
+}
+// 默认适宽：rightbar 窄列里 1.5 倍缩放会把页面撑出视口（中英对照双栏页宽≈2×，更明显）
+let fitMode = true;
+const fitBtn = $('zoom-fit');
+fitBtn.classList.add('active');
+function exitFitMode() { fitMode = false; fitBtn.classList.remove('active'); }
+/** 适宽的可用宽度（分屏时按**较窄的那一列**算，保证两列页高一致）。每列 padding 16px×2。 */
+function fitPaneWidth() {
+  if (viewMode === 'split') {
+    const avail = [$('pdf-pane').clientWidth - 32, $('pdf-pane-zh').clientWidth - 32].filter((w) => w > 0)
+    if (!avail.length) return 0
+    return Math.min(...avail)
+  }
+  return $('pdf-pane').clientWidth - 32
+}
+function fitToWidth() {
+  if (!pdfDoc) return // resize 可能先于首次 loadPdf 触发（布局换位/条带注入会改容器尺寸）
+  const paneWidth = fitPaneWidth()
+  if (paneWidth <= 0) return // 隐藏期间尺寸为 0，算出的缩放无意义
+  return pdfDoc.getPage(1).then((p) => setZoom(paneWidth / p.getViewport({ scale: 1 }).width))
+}
+$('zoom-in').onclick = () => { exitFitMode(); setZoom(zoomScale + 0.25); };
+$('zoom-out').onclick = () => { exitFitMode(); setZoom(zoomScale - 0.25); };
+// Ctrl+wheel zoom: begin
+// 只缩放 PDF：即时缩放已有画面，高清位图在滚轮停下后后台替换。
+function onPdfWheel(event) {
+  if (!event.ctrlKey || !pdfDoc || !Number.isFinite(event.deltaY) || event.deltaY === 0) return;
+  event.preventDefault();
+  event.stopPropagation(); // 不让外层浏览器把整个应用一起缩放
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? event.currentTarget.clientHeight : 1;
+  const delta = Math.max(-100, Math.min(100, event.deltaY * unit));
+  exitFitMode();
+  setZoom(zoomScale * Math.exp(-delta * 0.0012), { pane: event.currentTarget, x: event.clientX, y: event.clientY });
+}
+for (const id of ['pdf-pane', 'pdf-pane-zh']) {
+  $(id).addEventListener('wheel', onPdfWheel, { passive: false });
+}
+// Ctrl+wheel zoom: end
+fitBtn.onclick = () => { if (!pdfDoc) return; fitMode = true; fitBtn.classList.add('active'); fitBtn.blur(); fitToWidth(); };
+window.addEventListener('resize', () => {
+  if (viewMode === 'split' && window.innerWidth < SPLIT_MIN_WIDTH) {
+    // 分屏被缩到硬闸门以下：回落原文 + 同一提示（§4.2）
+    toast('面板太窄，请把阅读器拉宽后再用分屏对照', 4000);
+    setViewMode('orig');
+    return;
+  }
+  if (fitMode) fitToWidth(); // setZoom → rerender，顺带消化 pendingRerender
+  else if (pendingRerender && pdfDoc) { pendingRerender = false; rerender(); } // 隐藏期间欠下的重渲，恢复尺寸后补画
+});
+
+/** 原文列的页节点：分屏时中文列有**同样的 page 号**，不加限定会取到中文列（C18/R7）。
+ *  统一收敛到 `#pdf-pages` 之下——四个引文高亮/跳转入口共用。 */
+function origPageNode(n) {
+  return document.querySelector(`#pdf-pages .page[data-page="${n}"]`);
+}
+
+/* ================= 翻页模式：页码控件 + 模式切换 + 键盘 ================= */
+function flashPage() {
+  const div = origPageNode(curPage);
+  if (!div) return;
+  div.classList.add('flash');
+  setTimeout(() => div.classList.remove('flash'), 1600);
+}
+
+/** 页码控件刷新：输入框（未聚焦时才回写，别打断正在敲页码的人）/总页数/首末页禁用。 */
+function updatePager() {
+  const total = pdfDoc ? pdfDoc.numPages : 0;
+  $('page-total').textContent = '/ ' + (total || '?');
+  const input = $('page-input');
+  if (document.activeElement !== input) input.value = total ? curPage : '';
+  $('page-prev').disabled = pageMode === 'paged' && curPage <= 1;
+  $('page-next').disabled = pageMode === 'paged' && curPage >= total;
+}
+
+/** 跳到第 n 页（夹取）：paged 重渲单页+闪烁；scroll 平滑滚到该页。 */
+async function goPage(n) {
+  if (!pdfDoc) return;
+  const p = Math.min(Math.max(1, (n | 0) || 1), pdfDoc.numPages);
+  if (pageMode === 'paged') {
+    if (p === curPage) { flashPage(); return; }
+    curPage = p;
+    await rerender();
+    flashPage();
+  } else {
+    curPage = p;
+    jumpToPage(p);
+  }
+  updatePager();scheduleReadingPosition();
+}
+
+$('page-prev').onclick = () => goPage(curPage - 1);
+$('page-next').onclick = () => goPage(curPage + 1);
+function commitPageInput() {
+  const v = parseInt($('page-input').value, 10);
+  if (Number.isFinite(v) && v >= 1) goPage(v);
+  else updatePager(); // 非法输入：恢复当前页显示
+}
+// Enter 走 blur 统一提交；Escape 只恢复显示不跳页（标志位让 blur 知道这是放弃编辑）
+let pageInputEscaped = false;
+$('page-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+  else if (e.key === 'Escape') { pageInputEscaped = true; e.target.blur(); }
+});
+$('page-input').addEventListener('blur', () => {
+  if (pageInputEscaped) { pageInputEscaped = false; updatePager(); return; }
+  commitPageInput();
+});
+
+/** 模式切换：paged→scroll 先全量渲染再跳回当前页；scroll→paged 用观察器最近回写的 curPage。
+    图标显示「当前模式」：书本 = 单页翻页（active）/ 卷轴 = 连续滚动。 */
+function updateModeToggle() {
+  const btn = $('mode-toggle');
+  btn.innerHTML = iconHtml(pageMode === 'paged' ? 'paged' : 'scroll');
+  btn.classList.toggle('active', pageMode === 'paged');
+  btn.title = pageMode === 'paged' ? '当前：单页翻页，点击切回连续滚动' : '当前：连续滚动，点击切到单页翻页';
+  updatePager();
+}
+$('mode-toggle').onclick = async () => {
+  if (!pdfDoc) return;
+  pageMode = pageMode === 'paged' ? 'scroll' : 'paged';
+  localStorage.setItem('dpr.pageMode', pageMode);
+  updateModeToggle();
+  if (pageMode === 'paged') {
+    await rerender();          // 分屏时转 renderSplit（两列同渲 curPage）
+    flashPage();
+  } else {
+    await rerender();          // 非分屏时等价于 renderAllPages
+    jumpToPage(curPage);
+  }
+};
+updateModeToggle();
+
+// 键盘翻页（仅 paged）：输入框聚焦/带修饰键时不抢；Space 在单页模式下无滚动量，拿来做下一页
+document.addEventListener('keydown', (e) => {
+  if (pageMode !== 'paged' || !pdfDoc) return;
+  const tag = (e.target.tagName || '').toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') { e.preventDefault(); goPage(curPage + 1); }
+  else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); goPage(curPage - 1); }
+  else if (e.key === 'Home') { e.preventDefault(); goPage(1); }
+  else if (e.key === 'End') { e.preventDefault(); goPage(pdfDoc.numPages); }
+});
+
+function jumpToPage(n) {
+  if (pageMode === 'paged') { goPage(n); return; }
+  const div = origPageNode(n);   // 引文跳转只作用于原文列（分屏时中文列不得被滚到）
+  if (!div) return;
+  div.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  div.classList.add('flash');
+  setTimeout(() => div.classList.remove('flash'), 1600);
+}
+
+/* 片段定位高亮（跳转链接的 &q= 引文）：在指定页 textLayer 里找 q、高亮并滚到它。
+   归一化时忽略空白/连字符/软连字符、大小写 —— 论文跨行断词（dis-tributed）也能命中。
+   找不到（如用户在中文界面而 q 是英文原文）返回 false，调用方退回仅跳页。 */
+function clearHighlights() {
+  document.querySelectorAll('.textLayer span.dpr-hl').forEach((sp) => sp.classList.remove('dpr-hl'));
+  clearEqHit(); // 公式命中描边与引文高亮同生共死（用户在别处点一下即清）
+}
+// 高亮的消失交给用户：阅读器里任意点一下即清（mousedown 比 click 早，划选文字的那一下也算）
+document.addEventListener('mousedown', clearHighlights);
+
+function highlightSnippet(page, q) {
+  const spans = [...(origPageNode(page)?.querySelectorAll('.textLayer span:not(.markedContent)') ?? [])];
+  if (!spans.length || !q) return false;
+  let hay = '';
+  const startOf = [];
+  for (const sp of spans) { startOf.push(hay.length); hay += sp.textContent; }
+  // 归一化串 + 回原串的索引映射（归一化改变长度，不能直接用原索引）
+  const map = [];
+  let nh = '';
+  for (let i = 0; i < hay.length; i++) {
+    const c = hay[i].toLowerCase();
+    if (/\s/.test(c) || c === '-' || c === '­') continue;
+    nh += c; map.push(i);
+  }
+  const needle = q.toLowerCase().replace(/[\s\-­]+/g, '');
+  const at = needle ? nh.indexOf(needle) : -1;
+  if (at < 0) return false;
+  const from = map[at], to = map[at + needle.length - 1] + 1;
+  const hit = spans.filter((sp, i) => startOf[i] < to && startOf[i] + sp.textContent.length > from);
+  if (!hit.length) return false;
+  clearHighlights();
+  for (const sp of hit) sp.classList.add('dpr-hl');
+  hit[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+  return true;
+}
+
+/* 统一跳转入口：先等目标页渲染出来（fit 模式下 loadPdf 返回时页面可能还在渲），
+   有 q 就尝试片段高亮，否则整页跳转 + 边框闪烁。
+   paged 模式目标页不在 DOM 里（只渲当前页），轮询永远等不到 → 直接设页渲染。 */
+async function jumpTo(page, q) {
+  const p0 = Math.max(1, (page | 0) || 1);
+  if (pageMode === 'paged') {
+    if (!pdfDoc) return;
+    const p = Math.min(p0, pdfDoc.numPages);
+    if (p !== curPage) { curPage = p; await rerender(); }
+    if (!(q && highlightSnippet(p, q))) flashPage();
+    return;
+  }
+  for (let i = 0; i < 100; i++) {
+    if (pdfDoc && origPageNode(Math.min(p0, pdfDoc.numPages))) {
+      const p = Math.min(p0, pdfDoc.numPages);
+      if (!(q && highlightSnippet(p, q))) jumpToPage(p);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+/* ================= 公式引用（MinerU LaTeX，契约 §1） =================
+   PDF 文本层里的公式是乱码（`𝑧𝑧1 𝑧𝑧2`），鼠标选中拿不到可用内容；真相源是 MinerU
+   content_list 的 equation 块（LaTeX + bbox）。bbox 坐标系实测为「页面归一化坐标 ×1000」
+   （x÷页宽、y÷页高，各自归一），映射直接用渲染时的同一个 viewport，因此与缩放无关：
+       x = bbox[0]/1000*viewport.width ，y = bbox[1]/1000*viewport.height
+   热区外扩 6pt（实测最坏欠覆盖 4.60pt；6pt 覆盖全部 17/17 公式块）。 */
+const EQ_PAD = 6;                 // pt（= scale 1 时的 CSS px），随 zoomScale 放大
+let eqIndex = { source: 'none', equations: [], reason: 'no-mineru-artifact', bboxSpace: 'normalized-1000' };
+const EQ_BY_PAGE = new Map();     // pageNo → [{eq,x0,y0,x1,y1,w,h,pad}]
+let eqHoverId = null;
+
+/** 页节点被整体重建（renderAllPages / renderPaged 里 `container.innerHTML = ''`）时调用：
+    旧页的几何必须一起作废，否则命中测试会打到已卸载的页/上一档缩放的矩形（翻页模式下表现为
+    「点击整体偏移」）；顺手清掉跨页残留的 hover 态 —— eqHoverId 不清的话，setEqHover(id) 会在
+    `id === eqHoverId` 时提前 return，换页后鼠标停在公式上也不再出现虚线描边。 */
+function clearEqGeometry() {
+  EQ_BY_PAGE.clear();
+  eqHoverId = null;
+  clearEqHit();
+}
+
+/** 去掉 MinerU 文本外层 `$$`：`$$\n\\pi…\n$$` → `\pi…` */
+function eqLatex(raw) {
+  return String(raw == null ? '' : raw).replace(/^\s*\$\$?/, '').replace(/\$\$?\s*$/, '').trim();
+}
+/** 进会话的引用串：保留 `$$` 定界（模型对数学最友好） */
+function eqCite(eq) { return '$$ ' + eqLatex(eq.latex) + ' $$'; }
+
+/**
+ * MinerU **生效 mode**（GET /mineru/config 的 mode 字段）：'off' | 'local' | 'cloud' | null(未知)。
+ * 它是「重新转录」按钮的门控依据——`source:'auto'` 会按 mode 选引擎，而 mode==='off' 时
+ * auto 落到 pdf.js，pdf.js 重解析会**删掉** <文献>.mineru.md/.mineru.json 富产物
+ * （src/transcribe.ts）；宁可少一个按钮，也不给一个会反噬的按钮。
+ */
+let mineruMode = null;
+async function loadMineruMode() {
+  try {
+    const c = await api('/mineru/config');
+    mineruMode = c && typeof c.mode === 'string' ? c.mode : null;
+  } catch { mineruMode = null; }   // 取不到按「未知」处理（照常给按钮，行为与旧版一致）
+}
+
+function loadFormulas() {
+  return (async () => {
+    eqIndex = { source: 'none', equations: [], reason: 'no-mineru-artifact', bboxSpace: 'normalized-1000' };
+    if (!current) { renderEqPanel(); return; }
+    await loadMineruMode();
+    const q = readerQuery();
+    try {
+      const idx = await api('/formulas?' + q);
+      if (idx && Array.isArray(idx.equations)) eqIndex = idx;
+    } catch (e) {
+      // 接口异常绝不打崩阅读器：降级成「无公式」，划词提问照常
+      eqIndex = { source: 'none', equations: [], reason: 'bad-artifact', warning: e.message, bboxSpace: 'normalized-1000' };
+    }
+    const btn = $('eq-toggle');
+    btn.classList.toggle('muted', eqIndex.equations.length === 0);
+    btn.title = eqIndex.equations.length
+      ? `公式引用：${eqIndex.equations.length} 个（点击 PDF 上的公式即可引用其 LaTeX）`
+      : '公式引用：本论文还没有 MinerU 解析产物';
+    renderEqPanel();
+  })();
+}
+
+/** 热区只在「原文视图 + 有 bbox」时开启：译文版（-zh/-dual）页面几何与原文不同。 */
+function eqHotEnabled() {
+  return zhVariant === null && eqIndex.equations.some((e) => e.bbox);
+}
+
+function eqGeom(eq, viewport) {
+  if (!eq.bbox) return null;
+  const space = eqIndex.bboxSpace === 'page-units'; // 兜底分支（云端版本差异，见需求 R3）
+  const kx = space ? zoomScale : viewport.width / 1000;
+  const ky = space ? zoomScale : viewport.height / 1000;
+  const x = eq.bbox[0] * kx;
+  const y = eq.bbox[1] * ky;
+  const w = (eq.bbox[2] - eq.bbox[0]) * kx;
+  const h = (eq.bbox[3] - eq.bbox[1]) * ky;
+  if (!(w > 0) || !(h > 0)) return null;
+  return {
+    eq, x, y, w, h, pad: EQ_PAD * zoomScale,
+    x0: Math.max(0, x), y0: Math.max(0, y),
+    x1: Math.min(viewport.width, x + w), y1: Math.min(viewport.height, y + h),
+  };
+}
+
+/** 为已渲染的一页铺热区层（只画描边，不接事件）。
+ *  **只在原文列铺**：分屏（模式 B）时中文列的页号与原文列相同，而 EQ_BY_PAGE 是全局的，
+ *  照铺会让中文列的点击命中原文几何（C18/R7）。文档作用域从页节点自身读——唯一铺层点的
+ *  调用签名被既有断言钉死为 `paintEqLayer(div, viewport, +div.dataset.page)`
+ *  （test/merge-verify-t3.test.mjs 的 checkSolePaintPoint），不能再加第 4 个参数。 */
+function paintEqLayer(pageDiv, viewport, pageNo) {
+  const old = pageDiv.querySelector('.eqLayer');
+  if (old) old.remove();
+  const items = [];
+  const doc = pageDiv.dataset.doc || 'orig';
+  if (doc !== 'orig') return;   // 中文列：不建层、不写 EQ_BY_PAGE
+  if (eqHotEnabled()) {
+    const lay = document.createElement('div');
+    lay.className = 'eqLayer';
+    lay.style.width = viewport.width + 'px';
+    lay.style.height = viewport.height + 'px';
+    for (const eq of eqIndex.equations) {
+      if (eq.page !== pageNo) continue;
+      const g = eqGeom(eq, viewport);
+      if (!g) continue;
+      items.push(g);
+      const b = document.createElement('div');
+      b.className = 'eq-box';
+      b.dataset.eqId = eq.id;
+      b.style.left = g.x0 + 'px';
+      b.style.top = g.y0 + 'px';
+      b.style.width = Math.max(1, g.x1 - g.x0) + 'px';
+      b.style.height = Math.max(1, g.y1 - g.y0) + 'px';
+      lay.appendChild(b);
+    }
+    pageDiv.appendChild(lay);
+  }
+  EQ_BY_PAGE.set(pageNo, items);
+}
+
+/**
+ * 命中判定（契约 §1.4）：
+ *   1) 未外扩矩形包含点击点 → 取面积最小者（并列取阅读序靠前）；
+ *   2) 否则取外扩后包含该点、且到未外扩矩形距离最小者（并列同上）；
+ *   3) 都没有 → 不是公式点击。
+ * 为什么必须严格：实测同一页相邻公式块竖直间隙最小只有 0.8pt，6pt 外扩后必然重叠。
+ */
+function hitTestFormula(e) {
+  if (!eqHotEnabled()) return null;
+  const el = e.target;
+  const pageDiv = el && el.closest ? el.closest('.page[data-page]') : null;
+  if (!pageDiv) return null;
+  // 中文列（分屏）不得命中：它的页号与原文列相同，几何却属于原文页面（C18/R7）
+  if (pageDiv.dataset.doc && pageDiv.dataset.doc !== 'orig') return null;
+  const items = EQ_BY_PAGE.get(+pageDiv.dataset.page);
+  if (!items || !items.length) return null;
+  const box = pageDiv.getBoundingClientRect();
+  const px = e.clientX - box.left;
+  const py = e.clientY - box.top;
+  let best = null;
+  for (const it of items) {
+    if (px >= it.x0 && px <= it.x1 && py >= it.y0 && py <= it.y1) {
+      if (!best || it.w * it.h < best.w * best.h) best = it;
+    }
+  }
+  if (best) return best;
+  let bestD = Infinity;
+  for (const it of items) {
+    if (px < it.x0 - it.pad || px > it.x1 + it.pad || py < it.y0 - it.pad || py > it.y1 + it.pad) continue;
+    const dx = px < it.x0 ? it.x0 - px : (px > it.x1 ? px - it.x1 : 0);
+    const dy = py < it.y0 ? it.y0 - py : (py > it.y1 ? py - it.y1 : 0);
+    const d = dx * dx + dy * dy;
+    if (d < bestD - 1e-6) { bestD = d; best = it; }
+    else if (Math.abs(d - bestD) <= 1e-6 && best && it.w * it.h < best.w * best.h) best = it;
+  }
+  return best;
+}
+
+function setEqHover(id) {
+  if (id === eqHoverId) return;
+  eqHoverId = id;
+  document.querySelectorAll('.eq-box.hover').forEach((el) => el.classList.remove('hover'));
+  if (id) {
+    const el = document.querySelector(`.eq-box[data-eq-id="${id}"]`);
+    if (el) el.classList.add('hover');
+  }
+}
+
+function clearEqHit() { document.querySelectorAll('.eq-box.hit').forEach((el) => el.classList.remove('hit')); }
+
+function markEqHit(eq) {
+  clearEqHit();
+  const el = document.querySelector(`.eq-box[data-eq-id="${eq.id}"]`);
+  if (el) el.classList.add('hit');
+}
+
+/** 引用一个公式：热区点击与面板条目共用这一条链路（契约 §1.5）。 */
+function citeFormula(eq, x, y) {
+  askSelection = {
+    text: eqCite(eq),
+    page: eq.page,
+    kind: 'equation',
+    latex: eqLatex(eq.latex),
+    equationIndex: eq.index,
+  };
+  markEqHit(eq);
+  const tag = `第 ${eq.page} 页 · 公式 ${eq.index}`;
+  const body = eqLatex(eq.latex).replace(/\s+/g, ' ');
+  showAskPop({ quote: body ? `${tag}：${body}` : tag, x, y });
+}
+
+function renderEqPanel() {
+  const meta = $('eq-meta');
+  const list = $('eq-list');
+  const eqs = eqIndex.equations;
+  list.innerHTML = '';
+  if (eqs.length) {
+    const src = [eqIndex.producer || 'MinerU', eqIndex.backend].filter(Boolean).join(' · ');
+    meta.textContent = `${eqs.length} 个公式 · ${src}${eqIndex.warning ? '（' + eqIndex.warning + '）' : ''}`;
+  } else {
+    meta.textContent = '';
+  }
+  if (zhVariant !== null) {
+    const n = document.createElement('div');
+    n.id = 'eq-note';
+    n.textContent = '当前是译文视图：没有公式位置信息（bbox 只对原文页面成立），切回原文即可点击公式。';
+    list.appendChild(n);
+  }
+  if (!eqs.length) {
+    const n = document.createElement('div');
+    n.id = 'eq-note';
+    n.textContent = eqIndex.reason === 'bad-artifact'
+      ? 'MinerU 产物损坏或不可读，已忽略（不影响阅读与划词提问）。'
+      : eqIndex.reason === 'no-equations'
+        ? '这篇论文没有解析出公式块（MinerU 产物存在，但 content_list 里没有 equation）。'
+        : mineruMode === 'off'
+          ? '未启用 MinerU：请到 dsh 设置 → 论文伴读 → MinerU 解析后端 选择「本地」或「云端」并保存，然后回到这里点「重新转录」。'
+          : '未找到 MinerU 解析产物。在 dsh 设置 → 论文伴读 → MinerU 解析后端 启用后点下面按钮重新转录。';
+    list.appendChild(n);
+    // 门控：mode==='off' 时不渲染按钮（auto 会落到 pdf.js 并删掉已有的 MinerU 富产物）；
+    // mode 未知（接口不可用）时照旧给按钮，保持与旧版一致的行为。
+    const canRetranscribe = (eqIndex.reason === 'no-mineru-artifact' || eqIndex.reason === 'no-equations') && mineruMode !== 'off';
+    if (canRetranscribe) {
+      const b = document.createElement('button');
+      b.id = 'eq-transcribe';
+      b.className = 'tbtn';
+      b.textContent = '用 MinerU 重新转录';
+      b.onclick = () => transcribeWithMineru(b);
+      list.appendChild(b);
+    }
+    return;
+  }
+  const byPage = new Map();
+  for (const eq of eqs) {
+    if (!byPage.has(eq.page)) byPage.set(eq.page, []);
+    byPage.get(eq.page).push(eq);
+  }
+  for (const [page, arr] of byPage) {
+    const h = document.createElement('div');
+    h.className = 'eq-page';
+    h.textContent = `第 ${page} 页`;
+    list.appendChild(h);
+    for (const eq of arr) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'eq-item';
+      item.dataset.eqId = eq.id;
+      const tag = document.createElement('span');
+      tag.className = 'eq-tag';
+      tag.textContent = `公式 ${eq.index}${eq.bbox ? '' : ' · 无位置信息'}`;
+      const code = document.createElement('code');
+      code.textContent = eqLatex(eq.latex) || '(空)';
+      item.appendChild(tag);
+      item.appendChild(code);
+      item.onclick = () => {
+        const r = item.getBoundingClientRect();
+        citeFormula(eq, r.left, r.bottom + 6);
+      };
+      list.appendChild(item);
+    }
+  }
+}
+
+async function transcribeWithMineru(btn) {
+  if (!current) return;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '转录中（可能需要几十秒）…';
+  try {
+    await api('/transcribe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      // source:'auto' = 按**当前生效 mode** 选引擎（local → 本地 MinerU；cloud → mineru.net 云端；
+      // off → pdf.js）。硬编码 'mineru-local' 会让配了云端的用户点一次失败一次（上游评审第 6 条）。
+      // 按钮本身在 mode==='off' 时不渲染（见 renderEqPanel 的门控），所以走到这里 mode 必为 local/cloud。
+      body: JSON.stringify({ ...readerReference(), force: true, source: 'auto' }),
+    });
+    toast('MinerU 转录完成');
+    await loadFormulas();
+    // 新索引到手：按**当前模式**重渲一次把热区铺上去（翻页模式下必须仍是 renderPaged，
+    // 否则会把全量页渲出来、摘掉 #pdf-pages 的 paged 类，与顶栏模式切换按钮的 active 状态脱节）
+    if (pdfDoc) await rerender();
+  } catch (e) {
+    toast('MinerU 转录失败：' + e.message, 6000);
+  } finally {
+    if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
+$('eq-toggle').onclick = () => {
+  const open = $('eq-panel').style.display !== 'block';
+  $('eq-panel').style.display = open ? 'block' : 'none';
+  $('eq-toggle').classList.toggle('active', open);
+};
+
+let lastMove = { x: -1, y: -1 };
+document.addEventListener('mousemove', (e) => {
+  if (!eqHotEnabled()) { setEqHover(null); return; }
+  if (Math.abs(e.clientX - lastMove.x) < 2 && Math.abs(e.clientY - lastMove.y) < 2) return;
+  lastMove = { x: e.clientX, y: e.clientY };
+  const hit = hitTestFormula(e);
+  setEqHover(hit ? hit.eq.id : null);
+});
+
+/* ================= 选中即问（文字 + 公式共用一条链路） ================= */
+const askPop = $('ask-pop');
+let askSelection = null;
+// 拖拽起点：公式「点击」判定要求 mousedown→mouseup 位移很小（拖选文字不算点击）
+let downPt = null;
+
+/** 弹层共用的展示动作（文字引用与公式引用都走这里）。 */
+function showAskPop(o) {
+  $('ask-quote').textContent = o.quote.length > 140 ? o.quote.slice(0, 140) + '…' : o.quote;
+  $('ask-input').value = '';
+  $('ask-copy').style.display = askSelection && askSelection.kind === 'equation' ? 'inline-block' : 'none';
+  // 「译」只在「纯文字选区 + 原文视图 + **原文列** + 长度可翻译」时出现。
+  // 分屏（模式 B）时 zhVariant 刻意保持 null（C17），中文列也满足那个条件 —— 但中文列的字符
+  // 在 collectSelectionChars 里会被整体跳过（几何只对原文页成立）⇒ chunks 为空、只会弹
+  // 「选区已失效」。所以这里按列禁用（R-07：e.target/doc 判别），不给误导性文案。
+  $('ask-translate').style.display =
+    askSelection && askSelection.kind === 'text' && zhVariant === null
+      && (askSelection.doc ?? 'orig') === 'orig'
+      && askSelection.text.length <= MAX_SELECTION_CHARS
+      ? 'inline-block' : 'none';
+  hideTrPop(); // 新选区/新引用出现即收起上一个译文气泡（同一锚点必然重叠）
+  invalidateTranslate(); // R-01：新选区/新引用必须让在飞请求失效，否则旧译文会盖到新锚点上
+  askPop.style.display = 'block';
+  // 夹在 iframe 视口内（rightbar 窄列里也要能用）
+  const popW = 336, popH = 200;
+  askPop.style.left = Math.max(8, Math.min(o.x, window.innerWidth - popW - 8)) + 'px';
+  askPop.style.top = Math.max(8, Math.min(o.y, window.innerHeight - popH - 8)) + 'px';
+  $('ask-input').focus();
+}
+
+document.addEventListener('mousedown', (e) => { downPt = { x: e.clientX, y: e.clientY }; }, true);
+
+function selectionAsksAI() {
+  // Reader tools own their gestures; only ordinary selection opens the AI popup.
+  const tool = $('annotation-tool'), mode = $('interaction-mode');
+  return (!tool || tool.value === 'none') && (!mode || mode.value === 'select');
+}
+document.addEventListener('mouseup', (e) => {
+  if (askPop.contains(e.target) || !selectionAsksAI()) return;
+  setTimeout(() => {
+    if (!selectionAsksAI()) return;
+    const moved = downPt ? Math.abs(e.clientX - downPt.x) + Math.abs(e.clientY - downPt.y) > 4 : false;
+    downPt = null;
+    const sel = window.getSelection();
+    const text = sel ? sel.toString().trim() : '';
+    if (!text || !current) {
+      // 无选区（或没有当前文献）时才尝试公式点击 —— 有选区时「划词提问」优先，绝不抢。
+      if (!text && !moved && current) {
+        const hit = hitTestFormula(e);
+        if (hit) { citeFormula(hit.eq, e.clientX, e.clientY + 6); return; }
+      }
+      askPop.style.display = 'none';
+      return;
+    }
+    const node = sel.anchorNode && sel.anchorNode.parentElement;
+    if (!node || !node.closest('.textLayer')) { askPop.style.display = 'none'; return; }
+    const range = sel.getRangeAt(0).getBoundingClientRect();
+    // `doc` = 选区落在哪一列（'orig' | 'zh'）：分屏时中文列也有 .page 与文本层，但它的几何
+    // 对不上原文的 equation 索引，且不该出现「译」（R-07）。无条件写：普通模式恒为 'orig'。
+    const pageEl = node.closest('.page[data-doc]') || node.closest('.page');
+    askSelection = {
+      text,
+      page: +((pageEl || {}).dataset?.page || 0) || null,
+      kind: 'text',
+      doc: (pageEl && pageEl.dataset && pageEl.dataset.doc) || 'orig',
+    };
+    // 选区 Range 必须在**选中时**克隆存下来：用户点「译」时浏览器多半已清掉选区。
+    // 防御：DOM stub / 极端环境下 getRangeAt 可能不返回 Range（没有 cloneRange），此时存 null，
+    // 点「译」时按「页面已重绘，请重新选择」如实提示——绝不静默失败。
+    try {
+      const r0 = sel.getRangeAt(0);
+      if (r0 && typeof r0.cloneRange === 'function') askSelection.range = r0.cloneRange();
+    } catch { /* 选区已失效：保持无 range */ }
+    showAskPop({ quote: text, x: e.clientX, y: range.bottom + 8 });
+  }, 10);
+});
+document.addEventListener('mousedown', (e) => { if (!askPop.contains(e.target)) askPop.style.display = 'none'; });
+$('ask-cancel').onclick = () => { askPop.style.display = 'none'; };
+
+// 复制 LaTeX（显式动作：不自动写剪贴板，静默覆盖用户剪贴板是意外副作用）
+$('ask-copy').onclick = async () => {
+  const latex = askSelection && askSelection.kind === 'equation' ? askSelection.text : '';
+  if (!latex) return;
+  // 只在用户显式点按钮时写剪贴板；引用公式/弹气泡本身绝不自动写
+  toast((await copyText(latex)) ? '已复制公式 LaTeX' : '复制失败，请手动选择文本', 5000);
+};
+
+/** 剪贴板写入的**唯一**实现（路径复制与复制 LaTeX 共用）：clipboard API 优先，
+ *  失败/不可用（iframe 权限、非安全上下文）退回 textarea + execCommand。
+ *  返回是否成功——文案由调用方决定。 */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* 走下面的兜底 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+    return true;
+  } catch { return false; }
+}
+
+$('ask-send').onclick = async () => {
+  const question = $('ask-input').value.trim();
+  if (!question || !askSelection || !current) return;
+  $('ask-send').disabled = true;
+  try {
+    const askContext = readerAskContext(current);
+    // 公式引用额外带 kind/equationIndex：host 侧据此换用「引用了公式（LaTeX 源）」文案
+    const eq = askSelection.kind === 'equation'
+      ? { kind: 'equation', equationIndex: askSelection.equationIndex }
+      : {};
+    const r = await api('/ask', {
+      method: 'POST', headers: { 'content-type': 'application/json', ...askContext.headers },
+      body: JSON.stringify({ ...readerReference(), question, selectedText: askSelection.text, page: askSelection.page, ...eq, ...askContext.body }),
+    });
+    askPop.style.display = 'none';
+    toast(readerDock ? (askSelection.kind === 'equation' ? '已引用公式并发送到当前聊天' : '已发送到当前聊天，回答见对话区') : askSelection.kind === 'equation' ? `已引用公式并发送到 会话${r.n}` : `已发送到 会话${r.n}，回答见对话区`);
+  } catch (e) { toast('提问失败：' + e.message, 6000); }
+  $('ask-send').disabled = false;
+};
+$('ask-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('ask-send').click(); } });
+
+/* =====================================================================================
+   划词翻译（公式保留）—— 契约 docs/selection-translate-requirements.md §3.1–§3.3
+   · 触发：既有 #ask-pop 里新增的「译」按钮 → 隐藏 #ask-pop、弹独立译文气泡 #tr-pop
+   · 气泡**只有译文**（#tr-body）+ 状态行 + 一行诚实提示（#tr-note）；内部零 button
+   · 选区切块：display 公式按「字符矩形中心点 ∩ equation 盒」整段丢掉乱码、换成紧凑 LaTeX；
+     行内公式的还原在服务端做（客户端只送 chunk，不送任何矩形/bbox）
+   · 新代码一律放在 $('ask-cancel').onclick **之后**（既有源码切片断言，
+     test/reader-ux-verification.test.mjs VA9）
+   ===================================================================================== */
+const MAX_SELECTION_CHARS = 4000;   // 冻结：选区超长截断并提示
+const MAX_CHUNKS = 200;             // 与服务端同一套上限（§3.2-6）
+const MAX_TOTAL_CHARS = 8000;
+const TR_CLIENT_TIMEOUT_MS = 45000; // 服务端 30s，客户端 45s 兜底（§3.6）
+const trPop = $('tr-pop');
+let trBusy = false;
+let trSeq = 0;                      // 过期保护：换选区/换文献后旧译文不得盖上来（仿 renderToken）
+
+/**
+ * 让**在飞**的划词翻译请求失效（R-01）。调用点：`showAskPop`（新选区/新引用）与 `openPaper`（换文献）。
+ * 只自增 `trSeq` 会让旧请求的 `finally` 因为 `seq !== trSeq` 而不清 `trBusy`（按钮从此永久失效），
+ * 所以这里一并把 busy 复位；旧响应回来时 `seq` 不匹配 ⇒ 直接丢弃，绝不会写到新锚点的气泡上。
+ */
+function invalidateTranslate() {
+  trSeq++;
+  trBusy = false;
+  // 顺手收起气泡并清掉内容：在飞请求回来时会被 seq 拦下，**不会**再写气泡，
+  // 所以留着「翻译中…」或上一篇的译文都是误导（N-01 的窗口里尤其明显）。
+  hideTrPop();
+  $('tr-status').textContent = '';
+  $('tr-body').textContent = '';
+  $('tr-note').textContent = '';
+}
+
+function hideTrPop() { trPop.style.display = 'none'; }
+
+/* ── 译文里的公式渲染（vendored KaTeX，离线）────────────────────────────────────────────
+   译文是**模型输出，当不可信数据**处理，所以这里绝不 innerHTML：
+     · 文本段：一律 textContent；
+     · 数学段：KaTeX 渲染进**我们新建的**元素（trust:false → 不产原始 HTML；strict:'ignore'）；
+     · 渲染失败：该段**降级**为原始 LaTeX 文本（可读可复制），并在 #tr-note 如实提示第几个失败。
+   `splitTranslatedMath` / `trComposeNote` 是纯函数，可在 vm 里单测。 */
+
+/** 「这段 `$…$` 像不像数学」（与 src/translate-selection.ts 的 `isLatexLikeFragment` 同判据 + 两道收窄）。
+ *  过度识别的代价更大：`$5 到 $10`、`$HOME/bin:$PATH` 这类一旦被当公式，正文会被 KaTeX 吃掉。
+ *  规则（自上而下）：
+ *    ① 含 LaTeX 特征（`\` `_` `^` `{` `}` `&`）⇒ 像数学；
+ *    ② 含空白却没有特征 ⇒ 像散文/金额（`$5 up to $10`）⇒ 不是；
+ *    ③ 全大写标识符（`HOME`、`PATH`）⇒ 不是；
+ *    ④ `NAME:…` 形态（命令行/环境变量写法）⇒ 不是；
+ *    ⑤ 其余短符号串（`x`、`QK`、`a/b`）⇒ 是（上限 24 字符，避免把长路径吃掉）。 */
+function looksLikeMath(tex) {
+  const t = String(tex);
+  if (!t.trim()) return false;
+  if (/[\\_^{}&]/.test(t)) return true;
+  if (/\s/.test(t)) return false;
+  if (/^[A-Z][A-Z0-9_]*$/.test(t)) return false;
+  if (/^[A-Za-z0-9_./-]+:/.test(t)) return false;
+  return t.length <= 24;
+}
+
+/** 把译文切成 [{kind:'text'|'math', text, display, delim}]。
+ *  `$$…$$` 独立成行（可跨行）；`$…$` 行内（不跨行，避免把整段散文吞进公式）；`\$` 是字面美元号；
+ *  `\(…\)` 行内、`\[…\]` 独立成行（模型/上游有时给这套定界符，见 pr7 诊断 P2）；
+ *  定界符没有闭合、或 `$…$` 内容不像数学时按普通字符处理（绝不产生"半个公式"，也不吃正文）。 */
+function splitTranslatedMath(input) {
+  const s = String(input ?? '');
+  const out = [];
+  let buf = '';
+  const flush = () => { if (buf) { out.push({ kind: 'text', text: buf }); buf = ''; } };
+  for (let i = 0; i < s.length;) {
+    if (s[i] === '\\' && s[i + 1] === '$') { buf += '$'; i += 2; continue; }
+    // \(…\) 行内 / \[…\] 独立成行：与 $ 一样，必须找到闭合才认（否则按字面字符处理）
+    if (s[i] === '\\' && (s[i + 1] === '(' || s[i + 1] === '[')) {
+      const display = s[i + 1] === '[';
+      const closeSeq = display ? '\\]' : '\\)';
+      let j = i + 2;
+      let close = -1;
+      while (j < s.length) {
+        if (s[j] === '\\') {
+          if (s[j + 1] === (display ? ']' : ')')) { close = j; break; }
+          j += 2; continue;
+        }
+        if (!display && s[j] === '\n') break;   // 行内不跨行（同 $…$ 的口径）
+        j += 1;
+      }
+      const tex = close === -1 ? '' : s.slice(i + 2, close);
+      if (close !== -1 && tex.trim() && looksLikeMath(tex)) {
+        flush();
+        out.push({ kind: 'math', text: tex, display, delim: closeSeq });
+        i = close + 2;
+        continue;
+      }
+      buf += s.slice(i, i + 2); i += 2; continue;   // 不闭合/不像数学 → 原样当文本
+    }
+    if (s[i] !== '$') { buf += s[i]; i += 1; continue; }
+    const display = s[i + 1] === '$';
+    const open = display ? 2 : 1;
+    let j = i + open;
+    let close = -1;
+    while (j < s.length) {
+      if (s[j] === '\\') { j += 2; continue; }
+      if (display ? (s[j] === '$' && s[j + 1] === '$') : (s[j] === '$')) { close = j; break; }
+      if (!display && s[j] === '\n') break;          // 行内公式不跨行
+      j += 1;
+    }
+    if (close === -1) { buf += s.slice(i, i + open); i += open; continue; }
+    const tex = s.slice(i + open, close);
+    if (!tex.trim() || !looksLikeMath(tex)) { buf += s.slice(i, close + open); i = close + open; continue; }
+    flush();
+    out.push({ kind: 'math', text: tex, display, delim: open === 2 ? '$$' : '$' });
+    i = close + open;
+  }
+  flush();
+  return out;
+}
+
+/* 模式解析：MinerU 的**展示公式**常带 `\tag{}`（KaTeX 硬规则：\tag 只允许展示模式），而服务端
+   `assembleSource` 会把展示公式统一包成**行内 `$…$`** ⇒ 按 `display:false` 渲染必失败（pr7 诊断 P1：
+   35/37 真实 equation 命中）。这里先按切分结果探测，失败再按**另一种模式**探测：
+   只有真的行内渲染不了时才升级成展示模式 ⇒ **零误伤**（不会把普通行内公式变成块级）。
+   两种都失败返回 null，交给调用方走降级（原始 LaTeX + #tr-note，绝不留白）。 */
+function resolveMathMode(tex, display) {
+  const k = typeof window !== 'undefined' ? window.katex : null;
+  if (!k || typeof k.renderToString !== 'function') return null;
+  const probe = (d) => {
+    k.renderToString(tex, { displayMode: d, throwOnError: true, trust: false, strict: 'ignore' });
+    return d;
+  };
+  try { return probe(display); } catch { /* 按切分结果渲染不了 → 试另一种模式 */ }
+  try { return probe(!display); } catch { return null; }
+}
+
+/** 把一段 LaTeX 渲染进**我们新建的**元素（KaTeX，vendored 离线）。
+ *  · 先 `renderToString` + `throwOnError:true` 探一次：非法 LaTeX 在这里抛，交给调用方降级
+ *    （既满足契约参数 `throwOnError:false`，又不会把 KaTeX 自己画的红色错误当成功）；
+ *  · 真正渲染用契约参数：`throwOnError:false` / `trust:false` / `strict:'ignore'`。
+ *  **不写 innerHTML**：KaTeX 自己建 DOM 节点，模型输出只作为待转义的 LaTeX 文本传入。 */
+function renderMathSegment(el, tex, display) {
+  const k = typeof window !== 'undefined' ? window.katex : null;
+  if (!k || typeof k.renderToString !== 'function' || typeof k.render !== 'function') throw new Error('katex 不可用');
+  k.renderToString(tex, { displayMode: display, throwOnError: true, trust: false, strict: 'ignore' });
+  k.render(tex, el, { displayMode: display, throwOnError: false, trust: false, strict: 'ignore' });
+}
+
+/** 渲染译文到 #tr-body：文本段 textContent，数学段 KaTeX → 新建元素；渲染失败的段落回原始 LaTeX
+ *  文本（绝不空白）。返回未能渲染的公式序号（1 起，供 #tr-note 提示）。 */
+function trRenderBody(body) {
+  const host = $('tr-body');
+  host.textContent = '';
+  const failed = [];
+  let n = 0;
+  for (const seg of splitTranslatedMath(body)) {
+    if (seg.kind === 'text') {
+      const el = document.createElement('span');
+      el.textContent = seg.text;                       // ← 模型输出的文本：只用 textContent
+      host.appendChild(el);
+      continue;
+    }
+    n += 1;
+    // 先解析该用哪种模式（探测失败会换另一种重试），再决定元素的形态
+    const mode = resolveMathMode(seg.text, seg.display);
+    const block = mode === true;                        // 只有真的按展示模式渲染时才用块级
+    const el = document.createElement(block ? 'div' : 'span');
+    el.className = block ? 'tr-math tr-math-block' : 'tr-math';
+    let ok = mode !== null;
+    if (ok) { try { renderMathSegment(el, seg.text, mode); } catch { ok = false; } }
+    if (!ok) {
+      el.className = 'tr-math tr-math-fallback';
+      const delim = seg.delim ?? (seg.display ? '$$' : '$');
+      el.textContent = delim + seg.text + delim;        // 降级：原始 LaTeX 原样可见、可复制
+      failed.push(n);
+    }
+    host.appendChild(el);
+  }
+  return failed;
+}
+
+/** #tr-note 文案（**仍是纯文本**）：原有提示 + 渲染失败提示，如「第 2、5 个公式未能渲染（已按原样显示 LaTeX）」。 */
+function trComposeNote(note, failed) {
+  const base = String(note ?? '');
+  if (!failed || !failed.length) return base;
+  const which = failed.length === 1 ? `第 ${failed[0]} 个公式` : `第 ${failed.join('、')} 个公式`;
+  const hint = `${which}未能渲染（已按原样显示 LaTeX）`;
+  return base ? `${base} ${hint}` : hint;
+}
+
+/** 展示译文气泡。**绝不 innerHTML 模型输出**：文本段 textContent，数学段交 trRenderBody 渲染进新建元素。
+ *  定位照 openCfgPop：先显示再量尺寸，不写死宽高常量。 */
+function showTrPop(status, body, note) {
+  $('tr-status').textContent = status || '';
+  const failed = trRenderBody(body || '');
+  $('tr-note').textContent = trComposeNote(note, failed);
+  trPop.style.display = 'block';
+  let rect = { left: 16, bottom: 16 };
+  try { if (askSelection && askSelection.range) rect = askSelection.range.getBoundingClientRect(); } catch { /* 选区失效用兜底锚点 */ }
+  trPop.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - trPop.offsetWidth - 8)) + 'px';
+  trPop.style.top = Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - trPop.offsetHeight - 8)) + 'px';
+}
+
+/** 归属判定（§3.3① 冻结规则）：**字符矩形中心点落在 equation 盒内**（不用「有任何交叠」——
+ *  实测 2/18 例会把下一行正文吞进来）；并列取面积最小者（与既有热区点击 hitTestFormula 同规则）。 */
+function formulaBoxByCenter(rect, items) {
+  if (!items || !items.length) return null;
+  const cx = (rect[0] + rect[2]) / 2, cy = (rect[1] + rect[3]) / 2;
+  let best = null;
+  for (const it of items) {
+    if (cx >= it.x0 && cx <= it.x1 && cy >= it.y0 && cy <= it.y1) {
+      if (!best || it.w * it.h < best.w * best.h) best = it;
+    }
+  }
+  return best;
+}
+
+/** 当前页几何（paintEqLayer 写进 EQ_BY_PAGE 的 items）。仅在原文视图 + 有 bbox 时可用。 */
+function eqItemsFor(pageNo) {
+  if (!eqHotEnabled()) return null;
+  return EQ_BY_PAGE.get(pageNo) || null;
+}
+
+/** 字符序列 → chunk 序列（§3.2-6 冻结切法）。
+ *  chars: [{ch, page, rect}]（rect 为页面局部 px；缺失/退化的字符按纯文本处理）
+ *  规则：同页 + 同归属 + 无换行的最大连续段；换行是 text 段的结尾字符；公式段整体丢弃乱码、
+ *  换成紧凑 LaTeX（`$` 定界在服务端加）。 */
+function buildChunks(chars, itemsByPage) {
+  const out = [];
+  let cur = null;
+  const flush = () => { if (cur) out.push(cur); cur = null; };
+  for (const c of chars) {
+    // 命中物是热区几何 {eq, x0, y0, x1, y1, …}（见 eqGeom）；公式本体在 .eq 上
+    const hit = c.rect ? formulaBoxByCenter(c.rect, itemsByPage ? itemsByPage(c.page) : null) : null;
+    const entry = hit ? hit.eq : null;
+    const kind = entry ? 'formula' : 'text';
+    if (c.ch === '\n' && kind === 'text') {
+      if (cur && cur.kind === 'text') { cur.text += '\n'; flush(); }
+      else { flush(); out.push({ page: c.page, kind: 'text', text: '\n' }); }
+      continue;
+    }
+    if (cur && cur.page === c.page && cur.kind === kind && (kind === 'text' || cur.eqId === entry.id)) {
+      if (kind === 'text') cur.text += c.ch;
+      continue; // formula：同一条公式的后续字符直接丢弃（LaTeX 是原子的）
+    }
+    flush();
+    cur = kind === 'formula'
+      ? { page: c.page, kind: 'formula', latex: eqLatex(entry.latex), eqId: entry.id }
+      : { page: c.page, kind: 'text', text: c.ch };
+  }
+  flush();
+  // 规模闸门：段数 ≤200、单段 text ≤4000、总长 ≤8000（超限从尾部截断，并让调用方提示）
+  const capped = [];
+  let total = 0;
+  for (const c of out) {
+    const payload = c.kind === 'text' ? c.text : c.latex;
+    if (capped.length >= MAX_CHUNKS) break;
+    const room = MAX_TOTAL_CHARS - total;
+    if (room <= 0) break;
+    let s = payload;
+    const cap = c.kind === 'text' ? Math.min(MAX_SELECTION_CHARS, room) : room;
+    if (s.length > cap) {
+      // 截断回退到码点边界：slice 按 UTF-16 码元计数，切开代理对（数学斜体 𝑋 等）会让
+      // 翻译请求带孤立代理项、上游整轮 400（issue #9 同类）。宁可短 1 个码元。
+      let cut = cap;
+      const before = s.charCodeAt(cut - 1);
+      if (before >= 0xd800 && before <= 0xdbff && cut > 1) cut -= 1;
+      s = s.slice(0, cut);
+    }
+    if (!s) continue;
+    total += s.length;
+    capped.push(c.kind === 'text' ? { page: c.page, kind: 'text', text: s } : { page: c.page, kind: 'formula', latex: s });
+  }
+  return capped;
+}
+
+/** 选区覆盖的文本节点（按文档序）。手写递归而不是 createTreeWalker：
+ *  选区只需要「起点与终点之间的文本节点」，而 TreeWalker 在部分 webview/测试桩里缺实现。 */
+function textNodesUnder(node) {
+  const out = [];
+  const stack = [node];
+  while (stack.length) {
+    const n = stack.pop();
+    if (!n) continue;
+    if (n.nodeType === 3) { out.push(n); continue; }
+    const kids = n.childNodes ? [...n.childNodes] : [];
+    for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+  }
+  return out;
+}
+
+/** 选区内每个字符 + 它的页面局部矩形（页面局部 = rect 减 pageDiv 的 bounding rect；
+ *  `.page` 上没有 CSS transform，缩放体现在 viewport 尺寸里 ⇒ 与滚动/翻页/缩放都无关，
+ *  与既有 hitTestFormula 用的是同一套坐标）。 */
+function collectSelectionChars(range) {
+  const root = range.commonAncestorContainer;
+  if (!root) return [];
+  const nodes = textNodesUnder(root).filter((n) => {
+    if (typeof range.intersectsNode === 'function') { try { return range.intersectsNode(n); } catch { return true; } }
+    return n === range.startContainer || n === range.endContainer;
+  });
+  const out = [];
+  for (const node of nodes) {
+    const data = node.data ?? '';
+    let start = 0, end = data.length;
+    if (node === range.startContainer) start = range.startOffset;
+    if (node === range.endContainer) end = range.endOffset;
+    const parent = node.parentElement;
+    const pageDiv = parent && parent.closest ? parent.closest('.page[data-doc]') : null;
+    if (!pageDiv) continue;
+    const doc = pageDiv.dataset.doc || 'orig';
+    if (doc !== 'orig') continue;            // 分屏时中文列不参与公式归属（同一套几何只对原文成立）
+    const pageNo = +pageDiv.dataset.page || 0;
+    const box = pageDiv.getBoundingClientRect();
+    const cr = document.createRange();
+    for (let i = start; i < end; i++) {
+      let rect = null;
+      try {
+        cr.setStart(node, i); cr.setEnd(node, i + 1);
+        const r = cr.getBoundingClientRect();
+        if (r && r.width > 0 && r.height > 0) {
+          rect = [r.left - box.left, r.top - box.top, r.right - box.left, r.bottom - box.top];
+        }
+      } catch { rect = null; }              // 换行伪影/失效 Range：退化成纯文本字符
+      out.push({ ch: data[i], page: pageNo, rect });
+    }
+  }
+  return out;
+}
+
+/** #tr-note 的诚实降级文案（§3.8 文案表，优先级自上而下）。
+ *  ⚠️ 与需求表的一处**有意偏离**（已在实现报告里回报队长）：该表把 `unavailable` 排在
+ *  `formulaSkipped>0` 之前，但过短选区（如只选一个 `F`）会同时命中两者，按表顺序会显示
+ *  「没能定位到原文公式」——而验收项 A13 要求显示「选区太短，公式未还原」。这里让
+ *  「什么都没还原 + 有过短 chunk」先报「选区太短」：它更准确，也不会误导用户以为译文是准的。 */
+function trNote(resp) {
+  const reason = eqIndex && eqIndex.reason;
+  if (eqIndex && eqIndex.source === 'none' && reason === 'no-mineru-artifact') {
+    return '⚠ 该论文未用 MinerU 转录：原文里的公式在文本层不可读，译文可能不准（顶栏 ∑ 公式 → 「用 MinerU 重新转录」）';
+  }
+  if (reason === 'no-equations') return '⚠ MinerU 产物里没有公式块：公式可能不准';
+  if (reason === 'bad-artifact') return '⚠ MinerU 产物损坏或不可读，已忽略：公式可能不准';
+  if (resp.formulaLost > 0) return `⚠ 有 ${resp.formulaLost} 个公式未原样保留，请对照原文`;
+  if (resp.formulaSkipped > 0 && resp.formulaApplied === 0) return '⚠ 选区太短，公式未还原';
+  if (resp.formulaStatus === 'unavailable' && resp.hasBlockIndex) return '⚠ 没能定位到原文公式，译文可能不准';
+  if (resp.formulaStatus === 'partial') return '⚠ 部分公式未能还原，译文可能不准';
+  if (resp.formulaSkipped > 0) return '⚠ 选区太短，公式未还原';
+  return '';   // applied / formulaTotal===0：不显示任何提示
+}
+
+/** 失败反馈（§3.7② 表，逐条）。返回 {status, toast}：气泡状态行与 toast 的措辞不同处照表分开。 */
+function trFailure(e) {
+  if (e && e.clientTimeout) return { status: '翻译超时，请重试', toast: '翻译超时，请重试' };
+  if (e && e.code === 'timeout') return { status: '翻译超时，请重试', toast: '翻译超时，请重试' };
+  if (e && e.code === 'network') return { status: '翻译失败：无法连接端点', toast: '翻译失败：无法连接端点' };
+  const up = e && e.upstreamStatus;
+  if (up === 401 || up === 403) return { status: '翻译失败：端点拒绝（请检查 API key）', toast: `翻译失败：端点拒绝（HTTP ${up}）` };
+  if (up === 429) return { status: '翻译失败：请求过于频繁，稍后再试', toast: '翻译失败：请求过于频繁，稍后再试' };
+  if (typeof up === 'number' && up >= 500) return { status: '翻译失败：端点错误（HTTP 5xx）', toast: '翻译失败：端点错误（HTTP 5xx）' };
+  const m = '翻译失败：' + ((e && e.message) || '未知原因');
+  return { status: m, toast: m };
+}
+
+/** 划词翻译入口（#ask-translate.onclick）。 */
+async function translateSelection() {
+  // 中文列（分屏，doc==='zh'）不参与：几何只对原文页成立（R-07；按钮本身也不会显示）
+  if (!current || !askSelection || askSelection.kind !== 'text' || zhVariant !== null) return;
+  if ((askSelection.doc ?? 'orig') !== 'orig') return;
+  if (trBusy) return;
+  const range = askSelection.range;
+  if (!range || !range.startContainer || range.startContainer.isConnected === false) {
+    toast('页面已重绘，请重新选择', 4000);   // R5：绝不缓存矩形，也不静默失败
+    return;
+  }
+  // 用户点按钮时浏览器可能已把选区清掉：先把存下来的 Range 放回去，rects 才取得到
+  const sel = window.getSelection();
+  if (sel && sel.isCollapsed && typeof sel.addRange === 'function') {
+    try { sel.removeAllRanges(); sel.addRange(range); } catch { /* 失效选区：下面按空选区处理 */ }
+  }
+  let text = '';
+  try { text = String(range.toString() || ''); } catch { text = ''; }
+  if (!text.trim()) { toast('选区已失效，请重新选择', 4000); return; }
+  const chars = collectSelectionChars(range);
+  const chunks = buildChunks(chars, eqItemsFor);
+  if (!chunks.length) { toast('选区已失效，请重新选择', 4000); return; }
+  if (chars.length > MAX_SELECTION_CHARS) toast(`选区过长，只翻译前 ${MAX_SELECTION_CHARS} 字符`, 4000);
+
+  askPop.style.display = 'none';       // 同一锚点必然重叠 ⇒ 气泡「变成」译文气泡（§3.1）
+  showTrPop('翻译中…', '', '');
+  trBusy = true;
+  const seq = ++trSeq;
+  const ac = new AbortController();
+  let clientTimeout = false;
+  const timer = setTimeout(() => { clientTimeout = true; ac.abort(); }, TR_CLIENT_TIMEOUT_MS);
+  // 诊断可读性：记录本次送出的 chunk 规模（不含文本内容、不含 key）
+  const charsSent = chunks.reduce((n, c) => n + (c.kind === 'text' ? c.text.length : c.latex.length), 0);
+  try {
+    const resp = await api('/translate-selection', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...readerReference(), chunks }),
+      signal: ac.signal,
+    });
+    if (seq !== trSeq) return;          // 过期保护：用户已换选区/换文献
+    showTrPop('', resp.translation, trNote(resp));
+  } catch (e) {
+    if (seq !== trSeq) return;
+    if (clientTimeout) e.clientTimeout = true;
+    if (e && e.code === 'no-endpoint') {
+      // 未配置端点：打开既有设置浮层，保存成功后自动重试这次翻译（§3.7①）
+      showTrPop('未配置翻译端点', '', '在上面的设置里填好端点并保存，会自动重试这次翻译');
+      cfgRetryTranslate = true;
+      openCfgPop(false);
+      return;
+    }
+    const f = trFailure(e);
+    showTrPop(f.status, '', '');
+    toast(f.toast + `（选区 ${charsSent} 字符）`, 8000);
+  } finally {
+    clearTimeout(timer);
+    if (seq === trSeq) trBusy = false;
+  }
+}
+
+$('ask-translate').onclick = () => translateSelection();
+document.addEventListener('mousedown', (e) => { if (!trPop.contains(e.target)) hideTrPop(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideTrPop(); });
+
+/* =====================================================================================
+   分屏对照（模式 B）：原文 PDF ↔ -zh.pdf 并排同步滚动 —— §4.2/§4.4
+   · 两列各自一个 pdf.js 文档；全局 pdfDoc **保持指向原文**（既有逻辑零改动）
+   · zhVariant 保持 null ⇒ eqHotEnabled()/公式面板/适宽分支继续按「原文」工作（C17）
+   · 热区只在原文列铺（paintEqLayer 按 pageDiv.dataset.doc 早退）、只在原文列命中（C18/R7）
+   ===================================================================================== */
+const SPLIT_MIN_WIDTH = 640;   // 冻结：面板太窄不做分屏（§4.2）
+let pdfDocZh = null;
+let splitSyncing = false;
+let splitRaf = 0;
+let splitWarned = false;
+
+const rafFn = (fn) => (typeof window.requestAnimationFrame === 'function' ? window.requestAnimationFrame(fn) : setTimeout(fn, 0));
+const crafFn = (id) => { if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(id); else clearTimeout(id); };
+
+/** 纯函数：滚动位置 → 「顶部页号 + 页内比例」（§4.2 锚点）。
+ *  pages: [{page, offsetTop, offsetHeight}]，按 DOM 序。 */
+function anchorOf(pages, scrollTop) {
+  if (!pages || !pages.length) return null;
+  let page = pages[pages.length - 1];
+  for (const p of pages) { if (p.offsetTop + p.offsetHeight > scrollTop) { page = p; break; } }
+  return { page: page.page, ratio: (scrollTop - page.offsetTop) / Math.max(1, page.offsetHeight) };
+}
+
+/** 纯函数：锚点 → 目标列 scrollTop。页数相同（实测常态 19/19）走同页号；不同则按比例映射，
+ *  并让调用方给出「页数不一致」的一次性提示。 */
+function syncTargetOf(anchor, targetPages, srcPageCount) {
+  if (!anchor || !targetPages || !targetPages.length) return null;
+  const n = targetPages.length;
+  let mismatch = false;
+  let idx = targetPages.findIndex((p) => p.page === anchor.page);
+  if (idx < 0) {
+    mismatch = true;
+    idx = Math.min(n - 1, Math.max(0, Math.round((anchor.page - 1) * n / Math.max(1, srcPageCount | 0))));
+  } else if (srcPageCount && srcPageCount !== n) {
+    mismatch = true;
+  }
+  const p = targetPages[idx];
+  return { top: p.offsetTop + anchor.ratio * p.offsetHeight, mismatch };
+}
+
+/** 一列的页几何（DOM 序）。 */
+function columnPages(box) {
+  return [...box.children].filter((c) => c.className === 'page')
+    .map((d) => ({ page: +d.dataset.page || 1, offsetTop: d.offsetTop, offsetHeight: d.offsetHeight }));
+}
+
+const splitCols = () => [
+  { pane: $('pdf-pane'), box: $('pdf-pages') },
+  { pane: $('pdf-pane-zh'), box: $('pdf-pages-zh') },
+];
+
+/* =====================================================================================
+   同步滚动开关（模式 B 的可选项）—— 两处入口（分屏控件旁 + dsh 设置面板）、全局记忆、默认开
+   · 持久化键 `dpr.syncScroll`（'1'/'0'）：**故意不带 topic/name**，也**不在**
+     `dpr.variant.` / `dpr.sessionN.` 两个前缀里 —— lib/client.js 的改名搬家（migrateLsKeys）
+     只搬那两个前缀，所以论文/专题改名既不会搬它、更不会丢它（全局键本来就没有跟着某篇走的身份）。
+     取值缺省 = 开：与改造前「两列被 rAF 强行同步」的既有行为一致，老用户观感不变。
+   · 设置面板在**另一个文档**里（阅读器是同源 iframe）：两处靠 localStorage 的 storage 事件互通
+     （它只对**其他**文档触发，天然不会回声）——任一处改动，另一处立即反映。
+   · 关掉只关「持续联动」：进分屏/重渲时的一次性对齐（alignSplit）仍然执行，否则两列会停在不同页。
+   ===================================================================================== */
+const SYNC_SCROLL_KEY = 'dpr.syncScroll';
+let syncScroll = readSyncPref();
+/** 最后一次被用户滚过的那一列（关同步时也记）：重开同步时以它为基准对齐 —— 用户停在哪儿就对齐到哪儿。 */
+let splitLeadPane = null;
+
+/** 读偏好：只有显式的 '0' 算关，其余（含缺失/脏值）都算开。 */
+function readSyncPref() {
+  try { return localStorage.getItem(SYNC_SCROLL_KEY) !== '0'; } catch { return true; }   // 隐私模式读不了 → 默认开
+}
+function persistSyncPref() {
+  try { localStorage.setItem(SYNC_SCROLL_KEY, syncScroll ? '1' : '0'); } catch { /* 隐私模式写不了：本次会话内仍然生效 */ }
+}
+
+/** 开关控件（分屏控件旁）：**只在分屏（模式 B）下可见** —— 模式 A（-dual.pdf 一个 PDF 里并排嵌好）
+ *  与原文/译文视图都只有一个滚动条，本开关没有意义；隐藏而不是留个死控件。 */
+function updateSyncToggle() {
+  const b = $('sync-toggle');
+  if (!b) return;
+  b.style.display = viewMode === 'split' ? '' : 'none';
+  // 状态换图标（与 mode-toggle 的 paged/scroll、zh-toggle 的 translate/spin 同法）：
+  // data-icon 跟着渲染出来的图标走，图标本身由 iconHtml 统一给出（class="ic"、size、aria-hidden）
+  const icon = syncScroll ? 'sync' : 'syncOff';
+  b.dataset.icon = icon;
+  b.innerHTML = iconHtml(icon);
+  b.classList.toggle('active', syncScroll);
+  b.title = syncScroll
+    ? '同步滚动 / Sync scroll：开（两列一起滚，点击关闭）'
+    : '同步滚动 / Sync scroll：关（两列各自独立滚动，点击打开并对齐回当前页）';
+}
+
+/** 唯一写入口（按钮点击 / 设置面板的 storage 事件都走这里）：落持久化 → 刷新控件 → 打开时立刻对齐。 */
+function setSyncScroll(on, { persist = true, realign = true } = {}) {
+  syncScroll = !!on;
+  if (persist) persistSyncPref();
+  updateSyncToggle();
+  if (syncScroll && realign) alignSplit(currentLeadCol());
+}
+
+/** 重开同步时的基准列：用户最后滚过的那一列；没滚过（或那列已不在）就用原文列。 */
+function currentLeadCol() {
+  const cols = splitCols();
+  return cols.find((c) => c.pane === splitLeadPane) || cols[0];
+}
+
+/** 一次性对齐：把**跟随列**滚到基准列当前锚点对应的位置。
+ *  与 onSplitScroll 的区别是**不看 syncScroll** —— 进分屏 / 重渲 / 重开同步都必须先把两列摆到同一页，
+ *  否则用户看到「两列停在不同页」会以为坏了（关同步只关持续联动，不关「一开始就对齐」）。 */
+function alignSplit(src) {
+  if (viewMode !== 'split') return;
+  const other = splitCols().find((c) => c.pane !== src.pane);
+  if (!other) return;
+  const srcPages = columnPages(src.box);
+  const target = syncTargetOf(anchorOf(srcPages, src.pane.scrollTop), columnPages(other.box), srcPages.length);
+  if (!target) return;
+  splitSyncing = true;              // 跟随引起的 scroll 事件在下一帧被守卫吞掉（与 onSplitScroll 同法）
+  crafFn(splitRaf);
+  splitRaf = rafFn(() => {
+    try {
+      other.pane.scrollTop = target.top;
+      if (target.mismatch && !splitWarned) { splitWarned = true; toast('⚠ 中文版页数与原文不一致，按比例同步', 4000); }
+    } finally {
+      splitSyncing = false;
+    }
+  });
+}
+
+/** 分屏控件旁的开关：只在分屏下可见；模式 A / 单列下点不到，也绝不报错。 */
+$('sync-toggle').onclick = () => {
+  if (viewMode !== 'split') return;
+  setSyncScroll(!syncScroll);
+};
+
+/** 设置面板（dsh 设置 → 论文伴读）改了同一个键 → 阅读器立即反映（含重新打开同步时的一次性对齐）。
+ *  只在值真的变了的时候动：storage 只对**其他**文档触发，这里也不回写（不回写就不会回声）。 */
+window.addEventListener('storage', (e) => {
+  if (!e || e.key !== SYNC_SCROLL_KEY) return;
+  const next = e.newValue !== '0';
+  if (next === syncScroll) return;
+  setSyncScroll(next, { persist: false });
+});
+
+/** 滚动同步：主导方 = 用户正在滚的那一列；rAF 节流 + 守卫吞掉回声（§4.2/R7）。
+ *  syncScroll=false 时本函数直接早退 ⇒ 两列各自独立滚动（不节流、也不强行对齐）。 */
+function onSplitScroll(src) {
+  if (viewMode !== 'split' || splitSyncing || !syncScroll) return;
+  const other = splitCols().find((c) => c.pane !== src.pane);
+  if (!other) return;
+  splitSyncing = true;              // 跟随引起的 scroll 事件被守卫吞掉
+  crafFn(splitRaf);
+  splitRaf = rafFn(() => {
+    try {
+      // 排到这一帧时开关可能已被关掉（用户点了开关、或面板刚同步过来）：在飞的回调也不得再拉列，
+      // 否则「关掉后各自独立」会在下一帧被自己打破（F1 同一族问题）。
+      if (!syncScroll) return;
+      const srcPages = columnPages(src.box);
+      const a = anchorOf(srcPages, src.pane.scrollTop);
+      const t = syncTargetOf(a, columnPages(other.box), srcPages.length);
+      if (t) {
+        other.pane.scrollTop = t.top;   // behavior 默认 auto：不做平滑动画（会和同步互相打架）
+        if (t.mismatch && !splitWarned) { splitWarned = true; toast('⚠ 中文版页数与原文不一致，按比例同步', 4000); }
+      }
+    } finally {
+      splitSyncing = false;
+    }
+  });
+}
+
+/** 渲染一列的若干页（滚动=全量、翻页=curPage）。热区由 paintPage 按页节点的 data-doc 决定。 */
+async function renderColumn(doc, docKey, container, pages, token, scale) {
+  for (const i of pages) {
+    if (token !== renderToken) return;
+    const page = await doc.getPage(i);
+    if (token !== renderToken) return;
+    const viewport = page.getViewport({ scale });
+    const div = makePageNode(i, viewport, docKey, pageMode!=='paged');
+    container.appendChild(div);
+    if(pageMode==='paged')await paintPage(page, div, viewport, token);
+    else if(i%8===0)await new Promise(resolve=>setTimeout(resolve,0));
+    if (token !== renderToken) return;
+  }
+}
+
+/** 清空前捕获一列的滚动锚点：优先「页号 + 页内比例」（此刻旧页节点还在，页内几何有效）；
+ *  页节点不可用（并发重渲刚好清空过容器）时退回滚动比例锚点 —— 与 renderAllPages 同口径，
+ *  绝不把锚点归零成「回到第一页」。 */
+function captureScrollAnchor(pane, box) {
+  const pages = columnPages(box);
+  const a = pages.length ? anchorOf(pages, pane.scrollTop) : null;
+  if (a) return a;
+  const range = pane.scrollHeight - pane.clientHeight;
+  return { ratio: range > 0 ? pane.scrollTop / range : 0 };
+}
+
+/** 把一列恢复到自己捕获的锚点：优先「同页号 + 页内比例」（zoom / dppx 前后都落回**同一页**，
+ *  不因页面间 gap/padding 造成的比例漂移而挪页）；该页这次没有（页数变了/节点缺失）时退回滚动比例。 */
+function restoreScrollAnchor(pane, box, anchor) {
+  if (anchor && anchor.page != null) {
+    const p = columnPages(box).find((x) => x.page === anchor.page);
+    if (p) { pane.scrollTop = p.offsetTop + anchor.ratio * p.offsetHeight; return; }
+  }
+  const range = pane.scrollHeight - pane.clientHeight;
+  pane.scrollTop = (anchor && typeof anchor.ratio === 'number' ? anchor.ratio : 0) * Math.max(0, range);
+}
+
+/** 中文列这次重渲前是否有一个「和即将渲染的形态可比」的位置：重渲前的页数必须等于这次要渲染的页数
+ *  （还没渲过 / 页数变了 / 翻页↔滚动切换都不可比 —— 那些情况沿用统一对齐，见 renderSplit 尾注）。 */
+function zhOwnAnchorUsable(box, doc, paged) {
+  const before = columnPages(box).length;
+  if (before === 0) return false;
+  return before === (doc ? (paged ? 1 : doc.numPages) : 0);
+}
+
+/** 分屏全量渲染入口：两列同时渲（滚动=各列全量、翻页=两列同渲 curPage）。 */
+async function renderSplit() {
+  if (viewMode !== 'split') return rerender();
+  if (!pdfDoc) return;
+  const pane = $('pdf-pane');
+  if (pane.clientHeight === 0) { pendingRerender = true; return; } // 与既有渲染入口同一条守卫
+  const token = ++renderToken;
+  const scale = zoomScale;
+  const origBox = $('pdf-pages'), zhBox = $('pdf-pages-zh');
+  const range = pane.scrollHeight - pane.clientHeight;
+  const anchorRatio = range > 0 ? pane.scrollTop / range : 0;
+  // F1：清空前**各自**记下两列的锚点（此刻旧页节点还在）。同步关着时两列各回各的 ——
+  // 关掉同步的全部意义就是「两列读不同位置」，zoom / dppx / resize 一下不该把这个意图抹掉。
+  const zhPane = $('pdf-pane-zh');
+  const origAnchor = captureScrollAnchor(pane, origBox);
+  const zhAnchor = captureScrollAnchor(zhPane, zhBox);
+  const paged = pageMode === 'paged';
+  const zhOwn = zhOwnAnchorUsable(zhBox, pdfDocZh, paged);
+  origBox.innerHTML = '';
+  zhBox.innerHTML = '';
+  clearEqGeometry();   // 旧页几何 + 跨列残留的 hover/hit 描边一起作废
+  $('zoom-label').textContent = Math.round(scale / 1.5 * 100) + '%';
+  origBox.classList.toggle('paged', paged);
+  zhBox.classList.toggle('paged', paged);
+  curPage = Math.min(Math.max(1, curPage), pdfDoc.numPages);
+  updatePager();
+  const origList = paged ? [curPage] : Array.from({ length: pdfDoc.numPages }, (_, i) => i + 1);
+  await renderColumn(pdfDoc, 'orig', origBox, origList, token, scale);
+  if (token !== renderToken) return;
+  if (pdfDocZh) {
+    const zhPage = Math.min(Math.max(1, curPage), pdfDocZh.numPages);
+    const zhList = paged ? [zhPage] : Array.from({ length: pdfDocZh.numPages }, (_, i) => i + 1);
+    await renderColumn(pdfDocZh, 'zh', zhBox, zhList, token, scale);
+    if (token !== renderToken) return;
+  }
+  // 锚点恢复：重渲后两列各自回到重渲前的位置。
+  //  · 同步开着 / 刚进分屏（中文列还没有可比的位置）：**既有语义一字不动** —— 原文列按滚动比例回位，
+  //    中文列统一对齐到原文列（「进分屏的一次性对齐不看开关」是评审已裁定必要的行为，保持）；
+  //  · 同步关着且中文列有**同形态**的重渲前位置（F1 修法）：两列各回各的锚点 —— 不能让一次
+  //    zoom / dppx / resize 把「两列读不同位置」的意图抹掉。
+  if (!paged) {
+    if (syncScroll || !zhOwn) {
+      const newRange = pane.scrollHeight - pane.clientHeight;
+      pane.scrollTop = anchorRatio * Math.max(0, newRange);
+      splitSyncing = false;
+      alignSplit(splitCols()[0]);
+    } else {
+      restoreScrollAnchor(pane, origBox, origAnchor);
+      restoreScrollAnchor(zhPane, zhBox, zhAnchor);
+      splitSyncing = false;
+      crafFn(splitRaf);     // 作废可能在飞的对齐/联动回调：别让它下一帧再把中文列拉回原文列
+      splitRaf = 0;
+    }
+  }
+  restoreReadingPosition();
+  observePages();      // Main column remains the current-page owner.
+  if(!paged){await observeLazyPdfPages(origBox,pane);if(pdfDocZh)await observeLazyPdfPages(zhBox,zhPane);}
+}
+
+/** 进入分屏（或 openPaper 恢复分屏）：拉原文 + -zh.pdf 两个文档，两列同渲。 */
+async function openSplit() {
+  if (!current || !zhState.zh) return;
+  if (window.innerWidth < SPLIT_MIN_WIDTH) {
+    toast('面板太窄，请把阅读器拉宽后再用分屏对照', 4000);
+    if (viewMode === 'split') await setViewMode('orig');
+    return;
+  }
+  // pdf.js 必须先就绪（与 loadPdf 同一条通道）：openPaper 恢复「分屏」时页脚的经典脚本还在解析期，
+  // 动态 import 尚未完成 —— 直接触 pdfjsLib 会 ReferenceError，表现为
+  // 「打开中文版失败：pdfjsLib is not defined，已退回原文」+ 持久化写空（t3 报告 F3，6 次跑 5 次失败）。
+  await ensurePdfjs();
+  $('split-wrap').classList.add('on');
+  $('pdf-pane-zh').style.display = '';
+  splitWarned = false;
+  $('empty').style.display = 'none';
+  $('pager').style.display = '';
+  $('mode-toggle').style.display = '';
+  if (pdfDocZh) { try { await pdfDocZh.destroy?.(); } catch { /* 旧文档已释放 */ } pdfDocZh = null; }
+  try {
+    pdfDocZh = await pdfjsLib.getDocument({ url: pdfUrl('zh') }).promise;
+  } catch (e) {
+    // -zh.pdf 拿不到（被删/损坏）：回落原文 + 如实提示，不静默失败
+    await setViewMode('orig');
+    toast('打开中文版失败：' + (e && e.message ? e.message : e) + '，已退回原文', 6000);
+    return;
+  }
+  await loadPdf(pdfUrl(null), { deferRender: true }); // 原文列（pdfDoc 恒指原文），本函数自己安排渲染
+  // 分屏适宽：按较窄的那一列算一次（等价于 fitToWidth，但不让它触发一次多余的单列渲染）
+  const w = fitPaneWidth();
+  if (w > 0) {
+    const p1 = await pdfDoc.getPage(1);
+    zoomScale = Math.min(4.5, Math.max(0.6, w / p1.getViewport({ scale: 1 }).width));
+  }
+  await renderSplit();
+  attachSplitScroll();
+}
+
+/** 退出分屏：拆掉中文列、释放中文文档、同步监听。 */
+function teardownSplit() {
+  $('split-wrap').classList.remove('on');
+  $('pdf-pane-zh').style.display = 'none';
+  $('pdf-pages-zh').innerHTML = '';
+  $('pdf-pages-zh').classList.remove('paged');
+  splitCols().forEach((c) => { c.pane.onscroll = null; });
+  splitSyncing = false;
+  splitLeadPane = null;   // 分屏退出：上一轮「最后滚过的那一列」作废（下次进分屏回到原文列为准）
+  crafFn(splitRaf);
+  if (pdfDocZh) { try { pdfDocZh.destroy?.(); } catch { /* 已释放 */ } }
+  pdfDocZh = null;
+}
+
+/** 两列的滚动监听（各自一个，**不**共用一个滚动容器——R7 明令）。 */
+function attachSplitScroll() {
+  splitCols().forEach((col) => {
+    // 关掉同步时也记「最后滚过的那一列」：重开同步要按它对齐（见 setSyncScroll/currentLeadCol）
+    col.pane.onscroll = () => { splitLeadPane = col.pane; onSplitScroll(col); };
+  });
+}
+
+/* ================= 启动：URL 参数 > localStorage > 第一篇 ================= */
+async function bootstrap() {
+  const params = new URLSearchParams(location.search);
+  const pTopic = params.get('topic'), pName = params.get('name'), pId = params.get('paperId');
+  // 伴读会话里的跳转链接（[重读第 N 页](…?page=N)）经此直达目标页
+  const pPage = +(params.get('page') || 0) || undefined;
+  const pQ = params.get('q') || undefined;
+  if (pId !== null) {
+    if (!window.DprReaderSync.validId(pId)) throw Error('文献身份无效，请从文献库重新打开');
+    await openPaper(undefined, undefined, { paperId: pId, page: pPage, q: pQ }); return;
+  }
+  if (pTopic !== null || pName !== null) {
+    if (!pName) throw Error('文献链接缺少名称，请从文献库重新打开');
+    await openPaper(pTopic || undefined, pName, { page: pPage, q: pQ }); return;
+  }
+  if (readerDock) { $('empty').style.display = 'block'; $('empty').textContent = '请从右栏文献库选择文献。'; return; }
+  const lib = await api('/library');
+  if (lib.topics.length === 0) {
+    $('empty').style.display = 'block';
+    $('empty').innerHTML = '文献库为空。<br>在左侧文献库树上传 PDF 或新建专题即可开始。';
+    return;
+  }
+  let target = null;
+  if (pTopic && pName && lib.papers.some((p) => p.topic === pTopic && p.name === pName)) target = { topic: pTopic, name: pName };
+  else {
+    const last = JSON.parse(localStorage.getItem('dpr.last') || 'null');
+    if (last && lib.papers.some((p) => p.topic === last.topic && p.name === last.name)) target = last;
+    else target = lib.papers[0];
+  }
+  if (target) await openPaper(target.topic, target.name, { paperId: target.paperId, page: pPage, q: pQ });
+}
+bootstrap().catch((e) => {
+  $('empty').style.display = 'block';
+  $('empty').textContent = '文献库加载失败：' + e.message;
+});
+
+// 版本号未被 host 注入（旧宿主配新页面的错位场景）时藏掉占位符
+if (!/^v\d/.test(document.getElementById('ver').textContent)) document.getElementById('ver').style.display = 'none';
+
+window.dpr = {
+  version: document.getElementById('ver').textContent,
+  openPaper: (topic, name, page, q, paperId) => openPaper(topic, name, { page, q, paperId }),
+  current: () => current,
+  jumpToPage,
+  // 伴读会话的跳转链接用：当前文档里原地跳转，不重载 —— 用户正在看中文版就落在中文版；
+  // 带 q（原文短引文）时定位并闪烁高亮对应片段，找不到则退回整页跳转
+  jumpPage: (n, q) => { jumpTo(n, q); },
+};
+</script>
+<script src="/paper-reader/vendor/stable-zoom.js"></script>
+<script src="/paper-reader/vendor/reader-ux.js"></script>
+<link rel="stylesheet" href="/paper-reader/vendor/ink-overlay.css">
+<script>
+initDockReader();
+initReaderDismiss();
+for(const id of ['pdf-pane','pdf-pane-zh'])$(id).addEventListener('scroll',scheduleReadingPosition,{passive:true});
+window.addEventListener('pagehide',saveReadingPosition);
+window.addEventListener('blur',saveReadingPosition);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)saveReadingPosition();});
+document.addEventListener('dpr-page-painted',event=>{if(event.detail?.page)event.detail.page._dprPainted=true;});
+window.DprReaderInkBridge = {
+  current: () => current,
+  syncBlocked: () => readerSync?.blocked === true,
+  variant: () => zhVariant,
+  toast,
+  isCurrentPage: page => page._dprDocument === (page.dataset.doc === 'zh' ? pdfDocZh : pdfDoc),
+  wheel: (event, pane) => {
+    if (event.ctrlKey) onPdfWheel({ctrlKey:true,deltaY:event.deltaY,deltaMode:event.deltaMode,clientX:event.clientX,clientY:event.clientY,currentTarget:pane,preventDefault(){},stopPropagation(){}});
+    else { const unit=event.deltaMode===1?16:event.deltaMode===2?pane.clientHeight:1;pane.scrollTop+=event.deltaY*unit;pane.scrollLeft+=event.deltaX*unit; }
+  },
+};
+</script>
+<script src="/paper-reader/vendor/ink-overlay.js"></script>
+</body>
+</html>

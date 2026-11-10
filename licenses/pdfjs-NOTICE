@@ -1,0 +1,5 @@
+PDF.js — https://mozilla.github.io/pdf.js/
+Copyright Mozilla Foundation and the PDF.js contributors.
+Distributed under the Apache License, Version 2.0; see pdfjs-LICENSE.
+The vendored browser and worker files retain their original copyright headers.
+The Node package pdfjs-dist is installed separately by the package manager.

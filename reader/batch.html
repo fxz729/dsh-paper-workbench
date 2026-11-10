@@ -1,0 +1,107 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="dpr-ui-csrf" content="__DPR_UI_CSRF__"><title>跨库批量翻译</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--panel:#f6f8fa;--text:#24292f;--muted:#656d76;--border:#d0d7de;--accent:#0969da} @media(prefers-color-scheme:dark){:root{--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--border:#30363d;--accent:#58a6ff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.6 system-ui,sans-serif}header{padding:16px 20px;border-bottom:1px solid var(--border)}h1{margin:0;font-size:18px}p{margin:6px 0;color:var(--muted)}main{display:grid;grid-template-columns:minmax(230px,1fr) minmax(260px,1.2fr);gap:16px;padding:16px 20px}section{min-width:0}h2{font-size:14px;margin:0 0 8px}input[type=search]{width:100%;padding:7px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px}button{font:inherit;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 10px;cursor:pointer}button:disabled{opacity:.5;cursor:default}button.primary{background:var(--accent);color:var(--bg)}.actions{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.scroll{max-height:60vh;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px}.paper{display:flex;gap:6px;padding:5px 6px;overflow-wrap:anywhere}.topic{margin:6px 0 2px;padding:4px;background:var(--panel);font-weight:600}.job{border-bottom:1px solid var(--border);padding:8px 3px;overflow-wrap:anywhere}.meta{font-size:12px;color:var(--muted)}#status{min-height:1.5em;color:var(--muted)}#status.error{color:#d1242f}@media(max-width:650px){main{grid-template-columns:1fr}.scroll{max-height:35vh}}
+</style>
+<header><h1>跨库批量翻译</h1><p>默认跳过已有译文，不覆盖文件。一次处理一篇，避免叠加 API 并发。</p><p>关闭此页面或阅读器后继续；退出 DSH 后停止，重开后恢复未完成队列。暂停在当前文献结束后生效。</p><div id="status" role="status"></div></header>
+<main><section><h2>选择文献</h2><label for="translation-filter">译本筛选</label> <select id="translation-filter"><option value="pending">待翻译</option><option value="translated">已翻译</option><option value="all">全部</option></select><input id="search" type="search" placeholder="搜索专题或文献名" aria-label="搜索文献"><p class="meta">仅勾选当前可见的缺译文献。搜索或筛选变化会清空选择；组头只选择当前搜索结果。待确认／已译／活动队列不可批选。</p><div class="actions"><button id="select-visible">全选搜索结果</button><button id="clear-selection">清空选择</button><button id="enqueue" class="primary">加入队列（0）</button></div><div id="papers" class="scroll">正在加载…</div><h2>自动翻译</h2><label class="paper"><input id="global-automation" type="checkbox">全局自动翻译：所有文献库</label><p class="meta">覆盖现有和未来新建的所有文献库，仅处理开启后新加入的英文文献。默认关闭；历史文献可在上方手动批选。</p><h2>按文献库自动翻译</h2><p class="meta">默认关闭。开启后仅监听新加入的英文 PDF，现有文献不回溯；可能产生 API 费用。关闭自动翻译仅停止新增入队，不移除已排队或运行的任务；要阻止后续执行，请暂停队列。暂停队列不会关闭监听。</p><div id="automation-status" role="status">正在加载…</div><div id="automation-topics"></div><div id="cost-confirm" role="region" aria-label="确认自动翻译费用" hidden><p id="cost-description"></p><button id="confirm-automation">确认开启并接受费用</button> <button id="cancel-automation">取消</button></div><h2>待确认文献</h2><p class="meta">损坏、状态不明、源文件变化或语言不确定的文献不会自动覆盖，请先人工检查。</p><p class="meta">旧监听提示可移除，移除后保留防重复收费凭据；当前文件故障和队列任务仍保留。</p><button id="clear-legacy">清空历史提示</button><div id="pending-list" class="scroll"></div></section>
+<section><h2>后台队列</h2><div class="actions"><button id="pause">暂停后续任务</button><button id="resume">继续</button><button id="clear-finished">清理成功记录（保留失败）</button><button id="refresh">刷新</button></div><div id="summary" class="meta"></div><div id="queue-list" class="scroll">正在加载…</div></section></main>
+<script>
+(() => {
+ const $=id=>document.getElementById(id),selected=new Map();
+ let papers=[],topics=[],collections=[],queue={items:[],paused:false},automation={enabledTopics:[],pending:[],watching:false},mutating=false,ready=false,automationReady=false,refreshing=null,confirmTopic=null,syncError='';
+ const key=p=>p.kind==='legacy'&&p.id?'legacy:'+p.id:p.paperId?'paper:'+p.paperId:JSON.stringify([p.topic,p.name]);
+ const paperRef=p=>({topic:p.topic,name:p.name,...(p.paperId?{paperId:p.paperId}:{}),...(p.collectionId?{collectionId:p.collectionId}:{})});
+ const collectionRef=topic=>collections.find(c=>c.topic===topic)||{topic};
+ const state=p=>p.translation ? p.translation.state : 'missing';
+ const healthLabels={translated:'已翻译',missing:'待翻译',invalid:'待确认：译本损坏',unknown:'待确认：译本状态不明',stale:'待确认：源文件已变化'};
+ const labels={queued:'等待',running:'进行中',done:'完成',failed:'失败',skipped:'已有译文，跳过'};
+ async function api(path,body){const r=await fetch('/paper-reader/api'+path,{cache:'no-store',...(body?{method:'POST',headers:{'content-type':'application/json','x-dpr-ui-csrf':document.querySelector('meta[name="dpr-ui-csrf"]')?.content||''},body:JSON.stringify(body)}:{})});const d=await r.json();if(!r.ok)throw Error(d.error||'操作失败');return d;}
+ function message(text,error=false){$('status').textContent=text;$('status').classList.toggle('error',error);}
+ function preserveControls(root){
+  const focused=document.activeElement,label=root.contains(focused)?focused.getAttribute('aria-label'):null,top=root.scrollTop;
+  return ()=>{root.scrollTop=top;if(label){const next=[...root.querySelectorAll('[aria-label]')].find(e=>e.getAttribute('aria-label')===label);if(next&&!next.disabled)next.focus({preventScroll:true});}};
+ }
+ function active(p){return queue.items.some(i=>key(i)===key(p)&&['queued','running'].includes(i.status));}
+ function eligible(p){return state(p)==='missing'&&!active(p);}
+ function visible(){const q=$('search').value.toLocaleLowerCase(),filter=$('translation-filter').value;return papers.filter(p=>(p.topic+' '+p.name).toLocaleLowerCase().includes(q)&&(filter==='all'||(filter==='translated'?state(p)==='translated':eligible(p))));}
+ function pruneSelection(){const allowed=new Map(visible().filter(eligible).map(p=>[key(p),p]));for(const k of selected.keys()){const current=allowed.get(k);if(!current)selected.delete(k);else selected.set(k,paperRef(current));}}
+ function updateControls(){
+  const busy=mutating||!ready;
+  $('enqueue').textContent=`加入队列（${selected.size}）`;$('enqueue').disabled=busy||!selected.size;
+  for(const id of ['select-visible','clear-selection','clear-finished','search','translation-filter'])$(id).disabled=busy;
+  $('clear-finished').disabled=busy||!automationReady;
+  $('clear-legacy').disabled=busy||!automationReady||!automation.pending.some(p=>p.kind==='legacy');
+  $('refresh').disabled=mutating;
+  $('pause').disabled=busy||queue.paused;$('resume').disabled=busy||!queue.paused;
+  $('global-automation').disabled=busy||!automationReady;$('global-automation').checked=automation.globalEnabled===true;
+  $('confirm-automation').disabled=busy||!automationReady;$('cancel-automation').disabled=mutating;
+ }
+ function renderPapers(){
+  pruneSelection();const root=$('papers'),restore=preserveControls(root);root.replaceChildren();const groups=new Map();
+  for(const p of visible()){if(!groups.has(p.topic))groups.set(p.topic,[]);groups.get(p.topic).push(p);}
+  for(const [topic,group] of groups){
+   const candidates=group.filter(eligible),count=candidates.filter(p=>selected.has(key(p))).length;
+   const h=document.createElement('label');h.className='topic paper';const all=document.createElement('input');all.type='checkbox';all.dataset.topic=topic;all.setAttribute('aria-label','选择当前结果：'+topic);all.disabled=mutating||!ready||!candidates.length;all.checked=!!candidates.length&&count===candidates.length;all.indeterminate=count>0&&count<candidates.length;
+   all.onchange=()=>{if(mutating)return;for(const p of candidates)if(all.checked)selected.set(key(p),paperRef(p));else selected.delete(key(p));renderPapers();};const title=document.createElement('span');title.textContent=topic+'（可选 '+candidates.length+'）';h.append(all,title);root.append(h);
+   for(const p of group){
+    const row=document.createElement('label');row.className='paper';const c=document.createElement('input');c.type='checkbox';c.dataset.paper='';c.checked=selected.has(key(p));c.disabled=mutating||!ready||!eligible(p);c.setAttribute('aria-label','选择文献：'+p.topic+' / '+p.name);
+    c.onchange=()=>{if(mutating)return;if(c.checked&&eligible(p))selected.set(key(p),paperRef(p));else selected.delete(key(p));renderPapers();};
+    const text=document.createElement('span');text.textContent=p.name+' · '+(healthLabels[state(p)]||'待确认：未知状态')+(active(p)?' · 已在活动队列':'');row.append(c,text);root.append(row);
+   }
+  }if(!root.children.length)root.textContent='没有匹配的文献';updateControls();restore();
+ }
+ function renderQueue(){
+  const counts={};for(const i of queue.items)counts[i.status]=(counts[i.status]||0)+1;
+  $('summary').textContent=(queue.paused?'已暂停后续任务':'后台执行中')+' · '+Object.entries(counts).map(([k,v])=>(labels[k]||k)+' '+v).join(' / ');
+  const root=$('queue-list'),restore=preserveControls(root);root.replaceChildren();
+  for(const i of queue.items){
+   const row=document.createElement('div');row.className='job';const title=document.createElement('div');title.textContent=i.topic+' / '+i.name;
+   const meta=document.createElement('div');meta.className='meta';meta.textContent=(labels[i.status]||i.status)+(i.phase?' · '+i.phase:'')+(i.error?' · '+i.error:'');row.append(title,meta);
+   if(i.status==='failed'){const b=document.createElement('button');b.textContent='重试';b.setAttribute('aria-label','重试：'+i.topic+' / '+i.name);b.disabled=mutating||!ready;b.onclick=()=>action({action:'retry',id:i.id});row.append(b);}root.append(row);
+  }if(!root.children.length)root.textContent='队列为空';updateControls();restore();
+ }
+ function renderAutomation(){
+  $('automation-status').textContent=!automationReady?'自动翻译状态不可用（禁止更改及清理记录；旧版后端请重开 DSH）':(automation.watching?'监听中':'未监听')+(automation.error?' · '+automation.error:'');
+  const root=$('automation-topics'),restore=preserveControls(root);root.replaceChildren();
+  for(const topic of topics){const target=Object.freeze({...collectionRef(topic)});const row=document.createElement('label');row.className='paper';const c=document.createElement('input');c.type='checkbox';c.dataset.automation=topic;if(target.collectionId)c.dataset.collectionId=target.collectionId;c.checked=automation.enabledTopics.includes(topic);c.disabled=mutating||!ready||!automationReady||automation.globalEnabled===true;c.setAttribute('aria-label','自动翻译：'+topic);const text=document.createElement('span');text.textContent=topic+(automation.globalEnabled?' · 全局已开启':c.checked?' · 已开启':' · 关闭');row.append(c,text);root.append(row);
+   c.onchange=()=>{c.checked=automation.enabledTopics.includes(topic);if(mutating)return;if(c.checked)void setAutomation(target,false);else{confirmTopic=target;$('cost-description').textContent='确认开启「'+topic+'」？将监听未来新增的英文 PDF 并自动调用翻译 API，可能产生费用；已有文献不会回溯。';$('cost-confirm').hidden=false;$('confirm-automation').focus();}};
+  }
+  const pending=new Map();for(const p of papers)if(!['missing','translated'].includes(state(p)))pending.set(key(p),{...p,reason:healthLabels[state(p)]||'待确认：未知状态'});for(const p of automation.pending)pending.set(key(p),p);
+  const list=$('pending-list');list.replaceChildren();for(const p of pending.values()){const row=document.createElement('div');row.className='job';row.textContent=p.topic+' / '+p.name+' · '+(p.reason||healthLabels[p.state]||'待确认');if(p.kind==='legacy'&&p.id){const b=document.createElement('button');b.textContent='移除提示';b.setAttribute('aria-label','移除提示：'+p.topic+' / '+p.name);b.disabled=mutating||!ready||!automationReady;b.onclick=()=>dismissLegacy(p.id);row.append(' ',b);}list.append(row);}if(!list.children.length)list.textContent='没有待确认文献';updateControls();restore();
+ }
+ function render(){renderPapers();renderQueue();renderAutomation();}
+ async function refresh(){
+  if(refreshing)return refreshing;
+  refreshing=(async()=>{try{const [library,nextQueue,auto]=await Promise.all([api('/library'),api('/translation-queue'),api('/automation').then(value=>({value}),error=>({error}))]);papers=[...new Map(library.papers.map(p=>[key(p),p])).values()].sort((a,b)=>a.topic.localeCompare(b.topic)||a.name.localeCompare(b.name));collections=(library.collections||[]).filter(c=>c.collectionId&&Array.isArray(c.segments)&&c.segments.length).map(c=>({collectionId:c.collectionId,topic:c.segments.join('/')}));topics=[...new Set([...(library.topics||[]),...collections.map(c=>c.topic),...papers.map(p=>p.topic)])].sort();queue=nextQueue;ready=true;automationReady=!auto.error;if(auto.value)automation=auto.value;if(syncError)message('已同步文献库和队列');syncError='';render();}catch(e){ready=false;syncError='同步失败，暂不可操作：'+e.message;message(syncError,true);render();}finally{refreshing=null;}})();return refreshing;
+ }
+ async function action(body){
+  if(mutating||!ready)return;mutating=true;render();let result='操作完成',failed=false;
+  try{if(refreshing)await refreshing;if(!ready)throw Error('请先刷新文献库');
+   if(body.action==='enqueue'){
+    pruneSelection();const refs=[...selected.values()];if(!refs.length)throw Error('没有可加入的文献');let committed=0;
+    for(let offset=0;offset<refs.length;offset+=500){const batch=refs.slice(offset,offset+500);queue=await api('/translation-queue',{action:'enqueue',papers:batch});for(const p of batch)selected.delete(key(p));committed+=batch.length;message('已提交 '+committed+' / '+refs.length);render();}
+    result='已提交后台队列，可关闭此页面';
+   }else queue=await api('/translation-queue',body);
+  }catch(e){failed=true;result=e.message+'；未成功提交的选择已保留。';}
+  finally{await refresh();mutating=false;render();message(result+(syncError?'；'+syncError:''),failed||!!syncError);}
+ }
+ async function setAutomation(target,enabled){
+  if(mutating||!ready||!automationReady)return;mutating=true;render();let result='自动翻译已'+(enabled?'开启':'关闭'),failed=false;
+  try{if(refreshing)await refreshing;if(!ready||!automationReady)throw Error('自动翻译状态不可用');automation=await api('/automation',{...(target.scope==='global'?{scope:'global'}:target.collectionId?{collectionId:target.collectionId}:{topic:target.topic}),enabled,...(enabled?{confirmCosts:true}:{})});confirmTopic=null;$('cost-confirm').hidden=true;}catch(e){failed=true;result=e.message;}finally{await refresh();mutating=false;render();message(result+(syncError?'；'+syncError:''),failed||!!syncError);}
+ }
+ async function dismissLegacy(id){
+  if(mutating||!ready||!automationReady)return;mutating=true;render();let result='历史提示已移除，防重复收费凭据已保留',failed=false;
+  try{if(refreshing)await refreshing;if(!ready||!automationReady)throw Error('自动翻译状态不可用');automation=await api('/automation',{action:'dismiss-legacy',...(id?{id}:{})});}catch(e){failed=true;result=e.message;}finally{await refresh();mutating=false;render();message(result+(syncError?'；'+syncError:''),failed||!!syncError);}
+ }
+ $('clear-legacy').onclick=()=>dismissLegacy();
+ function changeView(){if(mutating)return;selected.clear();renderPapers();}
+ $('search').oninput=changeView;$('translation-filter').onchange=changeView;
+ $('select-visible').onclick=()=>{if(mutating||!ready)return;for(const p of visible().filter(eligible))selected.set(key(p),paperRef(p));renderPapers();};$('clear-selection').onclick=()=>{if(mutating)return;selected.clear();renderPapers();};
+ $('enqueue').onclick=()=>action({action:'enqueue'});for(const id of ['pause','resume','clear-finished'])$(id).onclick=()=>action({action:id});$('refresh').onclick=()=>{if(!mutating)void refresh();};
+ $('global-automation').onchange=()=>{const enabled=automation.globalEnabled===true;$('global-automation').checked=enabled;if(mutating||!ready||!automationReady)return;if(enabled)void setAutomation({scope:'global'},false);else{confirmTopic=Object.freeze({scope:'global'});$('cost-description').textContent='确认开启全局自动翻译？覆盖现有与未来所有文献库，仅翻译开启后新加入的英文 PDF，将调用翻译 API 并产生费用；历史文献不会回溯。';$('cost-confirm').hidden=false;$('confirm-automation').focus();}};
+ $('confirm-automation').onclick=()=>{if(confirmTopic!==null)void setAutomation(confirmTopic,true);};$('cancel-automation').onclick=()=>{if(mutating)return;confirmTopic=null;$('cost-confirm').hidden=true;};
+ updateControls();void refresh();
+ const timer=setInterval(()=>{if(!mutating)void refresh();},2000);window.addEventListener('pagehide',()=>clearInterval(timer),{once:true});
+})();
+</script></html>

@@ -1,0 +1,10 @@
+node_modules/
+release/
+artifacts/
+coverage/
+.env
+.env.*
+!.env.example
+runtime/ink-license.json
+*.log
+.DS_Store

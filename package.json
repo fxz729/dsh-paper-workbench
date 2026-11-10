@@ -1,0 +1,91 @@
+{
+  "name": "@fxz729/dsh-paper-workbench",
+  "version": "1.0.0",
+  "description": "DSH 文献工作台：嵌套文献库、文献管理工具、PDF 阅读、原生 AI 伴读、翻译与可选手写墨迹。",
+  "license": "MIT",
+  "type": "module",
+  "author": "fxz729",
+  "contributors": [
+    "GGboya (upstream dsh-paper-reader)"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fxz729/dsh-paper-workbench.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fxz729/dsh-paper-workbench/issues"
+  },
+  "homepage": "https://github.com/fxz729/dsh-paper-workbench#readme",
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": "0.2.2-rc.1"
+  },
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "lib",
+    "reader",
+    "runtime/*.py",
+    "cordis.patch.yml",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test.mjs",
+    "test:library": "node scripts/test.mjs --library",
+    "test:browser": "node tests/release-browser.cjs",
+    "check:package": "node scripts/check-package.mjs",
+    "pack:release": "node scripts/pack-release.mjs",
+    "smoke:install": "node scripts/smoke-install.mjs",
+    "check:public": "node scripts/check-public-content.mjs"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "paper",
+    "pdf",
+    "literature-management",
+    "research",
+    "translation",
+    "annotations"
+  ],
+  "dependencies": {
+    "@typesafe-ai/sdk": "0.6.0",
+    "pdfjs-dist": "6.4.299",
+    "undici": "8.12.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "esbuild": "0.27.3",
+    "playwright": "1.58.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tldraw": "5.6.0"
+  }
+}

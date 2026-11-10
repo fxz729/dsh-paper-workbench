@@ -1,0 +1,6 @@
+import test from 'node:test';import assert from 'node:assert/strict';import * as model from '../src/ink/ink-model.mjs';
+const ref={topic:'a',name:'p',variant:'orig'},key='dpr.ink.recovery.'+model.refKey(ref);
+function storage(){const map=new Map();return {map,setItem:(k,v)=>map.set(k,v),getItem:k=>map.get(k)||null,removeItem:k=>map.delete(k)};}
+const session=text=>({ref,dirty:true,recovery:()=>({format:'dpr-ink-recovery',document:{pages:{1:text}}})});
+test('another window recovery is archived before replacing the shared latest draft',()=>{assert.equal(typeof model.writeRecoveryCache,'function');const store=storage(),a=session('A'),b=session('B');model.writeRecoveryCache(a,store,'one');const old=store.getItem(key);model.writeRecoveryCache(b,store,'two');assert.equal(store.map.get('dpr.ink.archive.'+model.refKey(ref)+'.two'),old);assert.match(store.getItem(key),/B/);});
+test('successful disk save clears only the recovery written by that session',()=>{assert.equal(typeof model.clearRecoveryCache,'function');const store=storage(),a=session('A'),b=session('B');model.writeRecoveryCache(a,store,'one');model.writeRecoveryCache(b,store,'two');const newer=store.getItem(key);model.clearRecoveryCache(a,store);assert.equal(store.getItem(key),newer);model.clearRecoveryCache(b,store);assert.equal(store.getItem(key),null);});

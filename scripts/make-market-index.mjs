@@ -1,0 +1,12 @@
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { resolve, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+const root=fileURLToPath(new URL('../',import.meta.url));
+const commit=process.argv[2]||execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim();
+if(!/^[0-9a-f]{40}$/.test(commit))throw Error('A complete lowercase Git commit is required');
+const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
+const timestamp=Number(execFileSync('git',['show','-s','--format=%ct',commit],{cwd:root,encoding:'utf8'}).trim());
+const index={format:1,title:{en:'DSH Paper Workbench',zh:'DSH 文献工作台'},plugins:[{name:pkg.name,title:{en:'Paper Workbench',zh:'文献工作台'},description:{en:'Nested paper libraries, literature management tools, PDF reading, native AI chat and optional translation and ink.',zh:'嵌套文献库、文献管理工具、PDF 阅读与原生 AI 伴读，可选翻译和手写墨迹。'},author:'fxz729',homepage:'https://github.com/fxz729/dsh-paper-workbench',repository:'https://github.com/fxz729/dsh-paper-workbench',versions:[{version:pkg.version,publishTimestamp:timestamp,engines:{dsh:pkg.engines.dsh},source:{type:'git',url:'https://github.com/fxz729/dsh-paper-workbench',commit}}]}]};
+await mkdir(join(root,'marketplace'),{recursive:true});await writeFile(join(root,'marketplace/index.json'),JSON.stringify(index,null,2)+'\n');
+console.log('INDEX_WRITTEN '+commit);

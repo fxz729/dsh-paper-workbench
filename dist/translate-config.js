@@ -1,0 +1,125 @@
+// translate-config.ts — 翻译端点配置的落盘与解析（纯函数，不依赖 Cordis）。
+//
+// 存 $DSH_HOME/.dsh-paper-reader/translate.json（0600）——刻意不放 dataDir：
+// dataDir 是文献库目录，可能被 git / 云盘同步出去，密钥不该跟着走。
+// 优先级：文件 > profile 的 cordis.patch.yml config.translate（后者退为部署方默认值）。
+// 密钥只落盘、只回显掩码：任何读接口都不返回明文（apiKeyHint 是掩码后的展示串）。
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { dshHome } from "./library.js";
+// 预检会把端点响应体片段拼进错误文案，必须先脱敏（否则端点回显 Authorization 时 key 会泄露）。
+// 这里复用 MinerU 客户端里已经过三轮评审的 sanitizeDetail（含 URL 编码 / JSON 转义 / 短 key
+// 词边界处理）。mineru.ts 运行时只 import node:zlib（对 mineru-config.ts 是 type-only import），
+// 所以 translate-config → mineru 是单向依赖，**不会形成运行时循环**。
+import { sanitizeDetail } from "./mineru.js";
+export function translateConfigPath(home = dshHome()) {
+    return join(home, '.dsh-paper-reader', 'translate.json');
+}
+/** 三项齐全才算配好——babeldoc 的 --openai/--openai-model/--openai-base-url 缺一不可。 */
+function isComplete(e) {
+    return Boolean(e?.baseUrl && e?.apiKey && e?.model);
+}
+/** 按字段合并多个来源，靠后的覆盖靠前的；空字段不参与（避免 undefined 冲掉已有值）。 */
+function pick(...sources) {
+    const out = {};
+    for (const s of sources) {
+        if (!s)
+            continue;
+        if (s.baseUrl)
+            out.baseUrl = s.baseUrl;
+        if (s.apiKey)
+            out.apiKey = s.apiKey;
+        if (s.model)
+            out.model = s.model;
+    }
+    return out;
+}
+/** 读配置；文件缺失/损坏/形状不对一律返回 null（与 study.ts 的读策略一致）。 */
+export async function readTranslateConfig(home = dshHome()) {
+    try {
+        const data = JSON.parse(await readFile(translateConfigPath(home), 'utf8'));
+        if (typeof data !== 'object' || data === null)
+            return null;
+        const rec = data;
+        const out = {};
+        if (typeof rec['baseUrl'] === 'string')
+            out.baseUrl = rec['baseUrl'];
+        if (typeof rec['apiKey'] === 'string')
+            out.apiKey = rec['apiKey'];
+        if (typeof rec['model'] === 'string')
+            out.model = rec['model'];
+        return out;
+    }
+    catch {
+        return null;
+    }
+}
+/** 写配置。0600：文件含明文密钥，不靠 umask。 */
+export async function writeTranslateConfig(cfg, home = dshHome()) {
+    const file = translateConfigPath(home);
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, JSON.stringify(cfg, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+    await chmod(file, 0o600); // mode 只在新建时生效；已存在的文件要显式收紧
+}
+/** 删除配置（回落到 profile 的 translate）。文件不存在也算成功。 */
+export async function clearTranslateConfig(home = dshHome()) {
+    await rm(translateConfigPath(home), { force: true });
+}
+/** 解析生效端点：文件配全则用文件，否则用 profile，都配不全则返回能凑到的部分供报错。 */
+export async function resolveTranslateEndpoint(profile, home = dshHome()) {
+    const file = await readTranslateConfig(home);
+    if (isComplete(file))
+        return { endpoint: file, source: 'file' };
+    if (isComplete(profile))
+        return { endpoint: profile, source: 'profile' };
+    return { endpoint: pick(profile, file), source: 'none' };
+}
+/** 掩码展示：只露头 3 尾 4，够用户认出是哪把 key，又不足以还原。 */
+export function maskApiKey(key) {
+    return key.length <= 8 ? '••••' : `${key.slice(0, 3)}…${key.slice(-4)}`;
+}
+/**
+ * 连接预检：打一发极小的 chat/completions，确认 url/key/model 三者匹配。
+ * 必要性：babeldoc 一次要跑几分钟且**异步失败**（错误只落进 translate.ts 的 busy map），
+ * key 填错要等很久才知道，所以在落盘前先拦。
+ */
+export async function testTranslateEndpoint(ep) {
+    const { baseUrl, apiKey, model } = ep;
+    if (!baseUrl || !apiKey || !model)
+        return { ok: false, detail: '端点配置不完整（需要 url + key + 模型）' };
+    try {
+        const r = await fetch(baseUrl.replace(/\/+$/, '') + '/chat/completions', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+            // max_tokens:1 —— 只要能证明鉴权与模型名有效，不产生实际费用
+            body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
+            signal: AbortSignal.timeout(15_000),
+        });
+        if (r.ok) {
+            // 智谱系网关切错路径时（如 /api/v1）会回 HTTP 200 + {"code":1001,"success":false}，
+            // 只看状态码会误判成功，babeldoc 跑起来才炸。真成功必须有 choices。
+            // 上限放宽到 4000：GLM 等响应字段多，max_tokens:1 也有几百字节；
+            // 历史上 slice(0,300) 把合法 JSON 截断导致 parse 失败、误报「不是补全结果」（0.6.2 修复）
+            const text = (await r.text().catch(() => '')).slice(0, 4000);
+            try {
+                const data = JSON.parse(text);
+                if (Array.isArray(data.choices))
+                    return { ok: true };
+            }
+            catch { /* 非 JSON 也算失败，走下面报 body */ }
+            // 响应体可能回显 Authorization / 错误页：先按本次 key 脱敏再截断展示（保留排查价值）
+            return { ok: false, detail: `HTTP 200 但响应不是补全结果：${sanitizeDetail(text.slice(0, 200), apiKey)}（多半是端点路径不对，如智谱应为 /api/paas/v4）` };
+        }
+        const text = (await r.text().catch(() => '')).slice(0, 200);
+        return { ok: false, detail: `HTTP ${r.status}${text ? ' ' + sanitizeDetail(text, apiKey) : ''}` };
+    }
+    catch (err) {
+        // Node 的 fetch 把真实原因（ECONNREFUSED / 证书错误 / 超时）塞在 cause 里，
+        // 只报 "fetch failed" 对用户毫无帮助
+        const cause = err instanceof Error && err.cause instanceof Error ? `: ${err.cause.message}` : '';
+        // ⚠️ t7（t4 评审 R-04 的同类项）：这条 detail 会进响应体、再上屏（设置浮层）。
+        // fetch 抛出的原因串可能带上 baseUrl（含凭据/查询参数）或回显 Authorization ——
+        // 与同函数上面两条分支一样先过 sanitizeDetail；可读原因（ECONNREFUSED 等）不受影响。
+        return { ok: false, detail: sanitizeDetail((err instanceof Error ? err.message : String(err)) + cause, apiKey) };
+    }
+}

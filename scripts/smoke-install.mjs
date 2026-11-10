@@ -1,0 +1,33 @@
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve, dirname } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+const root=fileURLToPath(new URL('../',import.meta.url));
+const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
+const filename=process.argv[2]||join(root,'release',pkg.name.replace('@','').replace('/','-')+'-'+pkg.version+'.tgz');
+const owned=await mkdtemp(join(tmpdir(),'dsh-paper-workbench-install-'));
+const npm=process.env.npm_execpath;if(!npm?.endsWith('.js'))throw Error('Run with npm run smoke:install');
+const env={...process.env,DSH_HOME:join(owned,'home'),DSH_PAPER_READER_DATA:join(owned,'library')};
+for(const name of ['OPENAI_API_KEY','TYPESAFE_API_KEY','DSH_EMBED_API_KEY','MINERU_API_KEY','DSH_MINERU_LOCAL_URL'])delete env[name];
+try{
+ await mkdir(env.DSH_HOME,{recursive:true});await mkdir(env.DSH_PAPER_READER_DATA,{recursive:true});
+ await writeFile(join(owned,'package.json'),JSON.stringify({name:'isolated-plugin-install-check',version:'1.0.0',private:true,type:'module'}));
+ const install=spawnSync(process.execPath,[npm,'install','--omit=dev','--ignore-scripts','--no-audit','--no-fund',resolve(filename)],{cwd:owned,env,encoding:'utf8',maxBuffer:4*1024*1024,timeout:240000});
+ if(install.status!==0)throw Error('Clean tarball install failed: '+(install.stderr||install.error?.message));
+ const code=`import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import {apply} from '${pkg.name}';
+const entry=import.meta.resolve('${pkg.name}');
+const {getPaperRuntime}=await import(new URL('./library-runtime.js',entry));
+const definitions=new Map(),hooks=[];
+const ctx={on:(name,fn)=>{hooks.push(name);return()=>{};},tools:{register:d=>{assert.ok(d.output?.schema);definitions.set(d.name,d);},guard:()=>()=>{}},inject:()=>{},effect:fn=>fn()};
+let runtime;
+try{apply(ctx,{dataDir:process.env.DSH_PAPER_READER_DATA});runtime=getPaperRuntime(process.env.DSH_PAPER_READER_DATA,{});await runtime.ready;for(const name of ['list_papers','transcribe_pdf','search_paper','study_progress','study_update','library_manage'])assert.ok(definitions.has(name),name);const tool=definitions.get('library_manage'),exec={name:'library_manage',arguments:{action:'list'},token:Symbol('owned'),signal:new AbortController().signal};const result=await tool.execute(exec.arguments,exec);assert.equal(result.action,'list');const response=await readFile(new URL('../reader/index.html',entry),'utf8');assert.ok(response.includes('pdf-pane'));const manifest=JSON.parse(await readFile(new URL('../package.json',entry),'utf8'));assert.equal(manifest.name,'${pkg.name}');console.log(JSON.stringify({cleanInstall:true,actualDshToolsSdk:true,registered:[...definitions.keys()],localLibraryList:true,readerIncluded:true,externalModelRequests:0}));}finally{await runtime?.stop();}`;
+ await writeFile(join(owned,'smoke.mjs'),code);
+ const smoke=spawnSync(process.execPath,['smoke.mjs'],{cwd:owned,env,encoding:'utf8',maxBuffer:4*1024*1024,timeout:30000});
+ if(smoke.status!==0)throw Error('Installed plugin smoke failed: '+smoke.stdout+'\n'+smoke.stderr);
+ console.log(smoke.stdout.trim());await mkdir(join(root,'artifacts'),{recursive:true});
+ await writeFile(join(root,'artifacts/clean-install.json'),JSON.stringify({version:pkg.version,tarballInstall:true,actualDshToolsSdk:true,toolRegistration:true,localList:true,isolatedHome:true,paidRequests:0,fullDesktopAcceptance:false},null,2)+'\n');
+}finally{await rm(owned,{recursive:true,force:true});}
+console.log('CLEAN_INSTALL_OK; temporary home and installation removed');
